@@ -29,7 +29,6 @@ PANELS = [
     "settings",
     "push",
     "keepalive",
-    "diagnose",
     "atterm",
     "log",
 ]
@@ -167,6 +166,8 @@ const WebAsset* findWebPanelAsset(const char* name);
 
     cpp_parts.append("const WebAsset* findWebPanelAsset(const char* name) {")
     cpp_parts.append("  if (!name) return nullptr;")
+    # 旧诊断片段请求沿用系统设置资源，避免重复保留一份诊断页面。
+    cpp_parts.append('  if (strcmp(name, "diagnose") == 0) return &WEB_PANEL_SETTINGS;')
     for name in PANELS:
         cpp_parts.append(f'  if (strcmp(name, "{name}") == 0) return &WEB_PANEL_{name.upper()};')
     cpp_parts.append("  return nullptr;")

@@ -1,6 +1,4 @@
-<div class="panel" id="panel-push">
-      <h1 class="page-title">转发设置</h1>
-      <p class="page-subtitle">邮件通知与最多 5 个推送通道（POST JSON、Bark 官方/自建、钉钉、飞书、PushPlus、Server酱、Gotify、Telegram）</p>
+<div class="panel" id="panel-push" role="region" aria-label="转发设置">
       <div class="card-grid">
       <div>
       <form action="/save" method="POST" id="mainForm2">
@@ -29,7 +27,7 @@
         <div class="card-body">
           <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用推送转发</span><input type="checkbox" class="switch-input" name="pushEnabled" %PUSH_EN%><span class="switch-slider"></span></label>
           %PUSH_CHANNELS%
-          <button type="button" class="btn btn-secondary btn-block" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
+          <button type="button" class="btn btn-secondary btn-add" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
           <p class="form-hint" style="margin-top:8px;">删除通道会清空该槽位保存的 URL、密钥和高级参数，点击下方“保存推送通道”后生效；转发规则中对该槽位的引用不会自动删除。</p>
         </div>
       </div>
@@ -89,7 +87,7 @@
                 <input class="form-input" type="text" id="rtText" placeholder="粘贴一条短信正文，看看会命中哪条规则">
                 <button type="button" class="btn btn-secondary btn-sm" onclick="testRules()">测试匹配</button>
               </div>
-              <div class="result-box" id="rtResult"></div>
+              <div class="result-box" id="rtResult" role="status" aria-live="polite"></div>
             </div>
           </div>
         </div>

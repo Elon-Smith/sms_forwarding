@@ -4,9 +4,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const settle = () => new Promise(resolve => setImmediate(resolve));
-function app(initialUrl) {
+function app(initialUrl, deferStatus = false) {
   let savedUrl = initialUrl;
-  const posts = [], listeners = {};
+  const posts = [], listeners = {}, pending = [];
   const elements = {};
   const input = () => ({ value: '', checked: false, dataset: {}, classList: { add() {}, remove() {}, toggle() {} } });
   for (const id of ['kaUrl', 'pingUrl', 'kaEnabled', 'kaIntervalDays', 'kaAction', 'kaTarget', 'kaCard']) elements[id] = input();
@@ -31,6 +31,7 @@ function app(initialUrl) {
     },
     addEventListener() {}, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, clearInterval() {},
     fetch: async (url, options) => {
+      if (deferStatus && url.startsWith('/keepalive')) return new Promise(resolve => pending.push(data => resolve({ok: true, json: async () => data})));
       if (url === '/save') {
         assert.equal(options.method, 'POST');
         const fields = new URLSearchParams(options.body.toString());
@@ -44,7 +45,7 @@ function app(initialUrl) {
   context.window = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../code/web_src/app.js'), 'utf8'), context);
-  return { context, elements, posts, listeners };
+  return { context, elements, posts, listeners, pending };
 }
 (async () => {
   const urls = [
@@ -69,11 +70,46 @@ function app(initialUrl) {
     await settle();
     assert.equal(posts[0], url);
     e.kaUrl.value = ''; e.pingUrl.value = '';
+    // 模拟重新打开页面：首次状态回填标志随旧 DOM 一起销毁。
+    delete e.kaFormFlag;
     c.kaLoadStatus(); await settle();
     assert.equal(e.kaUrl.value, url);
     assert.equal(e.pingUrl.value, url);
     assert.equal(await c.kaSaveForm(), true);
     assert.equal(posts[1], url);
   }
-  console.log('keepalive URL save/reload UI regressions passed');
+  const {context: c, elements: e, pending, listeners} = app('https://example.com/payload', true);
+  c.kaLoadStatus();
+  e.kaEnabled.checked = true;
+  e.kaUrl.value = 'https://example.com/edited';
+  pending.shift()({enabled: false, intervalDays: 175, action: 1, target: 'saved-target', url: 'https://example.com/saved'});
+  await settle();
+  assert.equal(e.kaEnabled.checked, true, '迟到回填不能把用户开关改回去');
+  assert.equal(e.kaUrl.value, 'https://example.com/edited');
+  assert.equal(e.kaTarget.value, 'saved-target', '未编辑字段仍须完整回填');
+  assert.equal(e.kaIntervalDays.value, 175);
+  assert.ok(e.kaFormFlag);
+  e.kaEnabled.checked = false;
+  e.kaIntervalDays.value = 90;
+  c.kaLoadStatus();
+  pending.shift()({enabled: true, intervalDays: 175, url: 'https://example.com/saved'});
+  await settle();
+  assert.equal(e.kaEnabled.checked, false, '刷新执行状态不能覆盖未保存配置');
+  assert.equal(e.kaIntervalDays.value, 90);
+  c.kaLoadStatus();
+  const previousRequest = pending.shift();
+  c.kaLoadStatus();
+  pending.shift()({url: 'https://example.com/latest'});
+  await settle();
+  previousRequest({url: 'https://example.com/stale'});
+  await settle();
+  assert.equal(e.pingUrl.value, 'https://example.com/latest', '旧请求不能覆盖新请求');
+  delete e.kaFormFlag;
+  c.kaLoadStatus();
+  e.kaEnabled.checked = true; listeners.change({target: e.kaEnabled});
+  e.kaEnabled.checked = false; listeners.change({target: e.kaEnabled});
+  pending.shift()({enabled: true, url: 'https://example.com/saved'});
+  await settle();
+  assert.equal(e.kaEnabled.checked, false, '开关来回切换后仍须保留用户选择');
+  console.log('keepalive save/reload and delayed status regressions passed');
 })().catch(error => { console.error(error); process.exit(1); });

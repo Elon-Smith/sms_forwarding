@@ -1270,9 +1270,15 @@ static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base)
     return err;
 }
 
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
+                               const std::string* mdns_host)
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
+    std::string next_mdns;
+    if (mdns_host) {
+        next_mdns = *mdns_host;
+        sanitize_mdns_host(next_mdns);
+    }
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
@@ -1294,11 +1300,14 @@ esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
     nets[0].pass = pass;
 
     err = write_wifi_networks(nvs, nets);
+    // 两项使用同一次 NVS 提交，写入失败时不更新内存配置或启动连接。
+    if (err == ESP_OK && mdns_host) err = write_str(nvs, "mdnsHost", next_mdns);
     err = commit_field_save(nvs, err, "WiFi 配置");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) s_config.wifiNetworks[i] = nets[i];
         s_config.wifiFromFallback = false;
+        if (mdns_host) s_config.mdnsHost = next_mdns;
         xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);

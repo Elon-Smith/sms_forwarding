@@ -400,7 +400,9 @@ HTTP Basic Authentication，账号密码来自 `config.webUser` / `config.webPas
 | `GET /keepalive` | `handleKeepAlive()` | 保号：`?action=status\|run\|reset`；`run` 入队由 loop 执行（默认动作 = 蜂窝 HTTP payload 下载） |
 | `GET /testpush` | `handleTestPush()` | 通道测试：`?ch=` 入队，`?action=status` 轮询；真实发送在 worker |
 | `GET /ussd` | `handleUssd()` | USSD 查询（`AT+CUSD`，同步最长 ~20s） |
-| `GET /modem` `GET /wifi` `GET /wifiscan` `POST /wificonfig` | — | 模组信息 / WiFi 状态 / 扫描 / 保存并重启接入 |
+| `GET /modem` `GET /wifi` `GET /wifiscan` | — | 模组信息 / WiFi 状态 / 扫描 |
+| `POST /wificonfig` | `ssid`、`pass`、可选 `mdnsHost` | 保存 WiFi 与设备名称；省略名称保留原值，成功响应返回实际 `mdnsHost`。AP 模式原地连接，STA 模式保存后重启 |
+| `GET /apstatus` | — | 配网状态：`connected`、`ip`、`mdnsHost`，不含 WiFi 凭据；AP 模式免密，STA 模式需登录 |
 | `POST /reboot` `POST /factory` | `handleReboot()` / `handleFactory()` | 重启 / 恢复出厂（清 NVS） |
 | `GET /export` `POST /import` | `handleExport()` / `handleImport()` | 配置导出 / 导入（含凭据，注意保管） |
 | `GET /logdownload` | `handleLogDownload()` | 纯文本下载全部日志 |

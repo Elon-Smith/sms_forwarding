@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="SMS Forwarding brand graphic">
+    <defs></defs>
+    <g transform="translate(26 26) scale(1.8)"><g fill="none" stroke="#111111" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M73 42 H183 C204 42 219 57 219 80 V146 C219 169 203 184 180 184 H113 L72 216 V184 H73 C50 184 35 168 35 145 V81 C35 58 50 42 73 42Z" stroke-width="15.8"/>
+          <path d="M75 114 H165" stroke-width="19"/>
+          <path d="M138 85 L168 114 L138 143" stroke-width="19"/>
+          <path d="M76 145 H105" stroke-width="10" opacity="0.7"/>
+        </g></g>
+    </svg>

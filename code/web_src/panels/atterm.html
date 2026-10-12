@@ -1,10 +1,7 @@
-<div class="panel" id="panel-atterm">
-      <h1 class="page-title">AT 指令终端</h1>
-      <p class="page-subtitle">直接向模组发送 AT 指令并接收响应</p>
-      <div class="card">
-        <div class="card-header">终端</div>
-        <div class="card-body">
-          <div id="atLog">就绪 — 输入 AT 指令开始调试</div>
+<div class="panel" id="panel-atterm" role="region" aria-label="AT 指令终端">
+      <div class="card console-card at-console">
+        <div class="card-header">AT 终端<button type="button" class="btn btn-secondary btn-sm console-header-action" onclick="clearATLog()">清空输出</button></div>
+        <div class="card-body console-body">
           <div class="at-chips">
             <button type="button" class="at-chip" onclick="atQuick('AT+CSQ')">信号</button>
             <button type="button" class="at-chip" onclick="atQuick('AT+CEREG?')">注册状态</button>
@@ -14,9 +11,12 @@
             <button type="button" class="at-chip" onclick="atQuick('AT+CGSN')">模组序列号</button>
             <button type="button" class="at-chip" onclick="atQuick('AT+CGSN=1')">IMEI</button>
           </div>
-          <div class="at-bar"><input class="form-input" type="text" id="atCmd" placeholder="AT+CSQ　（↑/↓ 翻阅历史命令）"><button class="btn btn-primary btn-sm" onclick="sendAT()" id="atBtn">发送</button></div>
-          <div class="btn-row" style="margin-top:8px;"><button class="btn btn-secondary btn-sm" onclick="clearATLog()">清空日志</button></div>
-          <p class="form-hint">直接向模组串口发送指令并接收响应，请谨慎操作；常用指令可点上方快捷按钮，输入框支持 ↑/↓ 历史</p>
+          <div id="atLog" tabindex="0" aria-label="AT 指令响应">就绪 — 输入 AT 指令开始调试</div>
+          <div class="console-command">
+            <label class="form-label" for="atCmd">AT 指令</label>
+            <div class="at-bar"><input class="form-input" type="text" id="atCmd" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入指令，例如 AT+CSQ"><button type="button" class="btn btn-primary" onclick="sendAT()" id="atBtn">发送</button></div>
+            <p class="form-hint">Enter 发送 · ↑ / ↓ 翻阅历史。指令直接发往模组，操作前请确认用途。</p>
+          </div>
         </div>
       </div>
     </div>

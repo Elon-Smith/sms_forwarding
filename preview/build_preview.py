@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "code" / "web_src"
 OUT = ROOT / "preview" / "index.html"
-PANELS = ["overview", "sim", "inbox", "settings", "push", "keepalive", "diagnose", "atterm", "log"]
+PANELS = ["overview", "sim", "inbox", "settings", "push", "keepalive", "atterm", "log"]
 
 
 def read(path: Path) -> str:
@@ -61,6 +61,12 @@ mock_config = {
     "apn": "giffgaff.com",
     "phoneNumber": "+44 7700 900123",
     "operatorPlmn": "",
+    "wifiTxPowerQuarterDbm": 34,
+    "wifiNetworks": [
+        {"ssid": "Demo-WiFi", "passSet": True},
+        {"ssid": "Office-WiFi", "passSet": True},
+    ],
+    "simCredentials": [{"iccid": "89440000000000000000", "pinSet": True, "pukSet": True, "pinMax": 1, "pukMax": 1}],
     "pushChannels": [
         {
             "enabled": True,
@@ -95,10 +101,12 @@ mock_config = {
 }
 
 mock_status = {
-    "version": "1.0.4-preview",
+    "version": "1.1.7-preview",
     "modemReady": True,
     "modemPhase": "ready",
     "wifiConnected": True,
+    "simState": "ready",
+    "simCredentialMatched": True,
     "apMode": False,
     "ssid": "Demo-WiFi",
     "rssi": -58,
@@ -190,7 +198,7 @@ mock_sent = [
 
 mock_log = [
     "配置已加载: wifi=Demo-WiFi, webUser=admin",
-    "ESP-IDF 迁移版启动: 1.0.4-preview",
+    "ESP-IDF 迁移版启动: 1.1.7-preview",
     "Web 资源 hash=preview shell=1595 css=4249 js=16968",
     "mDNS 已启动: http://sms.local",
     "连接 WiFi: Demo-WiFi",
@@ -227,9 +235,16 @@ stub = f"""<script>
     if (url.indexOf('/ui?') >= 0) {{
       var m = url.match(/[?&]panel=([^&]+)/);
       var name = m ? decodeURIComponent(m[1]) : 'overview';
-      return resp({{}}, panels[name] || panels.overview);
+      return resp({{}}, panels[name === 'diagnose' ? 'settings' : name] || panels.overview);
     }}
     if (url.indexOf('/status') >= 0) return resp(status);
+    if (url.indexOf('/esim') >= 0) return resp({{
+      success:true, eid:'89049032000000000000000000000001', updatedLocal:'2026-10-12 20:40:00', profileCount:2,
+      profiles:[
+        {{iccid:'89440000000000000000', nickname:'主用短信卡', state:'enabled'}},
+        {{iccid:'89860000000000000001', nickname:'备用卡', state:'disabled'}}
+      ]
+    }});
     if (url.indexOf('/messages') >= 0 && url.indexOf('box=sent') >= 0) return resp(sent);
     if (url.indexOf('/messages') >= 0) {{
       var limited = url.indexOf('limit=1') >= 0 ? messages.slice(0, 1) : messages;
@@ -240,6 +255,7 @@ stub = f"""<script>
       var since = m ? parseInt(m[1], 10) : 0;
       return resp({{seq: logs.length, lines: since > 0 ? [] : logs}});
     }}
+    if (url.indexOf('/prevlog') >= 0) return resp({{}}, logs.slice(0, 6).join('\\n'));
     if (url.indexOf('/keepalive') >= 0) return resp({{
       enabled: true, intervalDays: 175, action: 1, target: '',
       url: 'http://gg.incrafttime.top/api/payload?size=64342',
@@ -247,13 +263,14 @@ stub = f"""<script>
       queued: false, running: false, done: true, success: true,
       message: '预览模式：保号状态正常'
     }});
+    if (url.indexOf('/schedtask') >= 0) return resp({{tasks: [], timeValid: true}});
     if (url.indexOf('/wifiscan') >= 0) return resp([
       {{ssid:'Demo-WiFi', rssi:-48, enc:1}},
       {{ssid:'Lab-5G', rssi:-67, enc:1}},
       {{ssid:'Guest', rssi:-72, enc:0}}
     ]);
     if (url.indexOf('/testpush') >= 0) return resp({{success:true, queued:false, running:false, done:true, success:true, message:'预览模式：测试推送成功'}});
-    if (url.indexOf('/ping') >= 0) return resp({{success:true, queued:false, running:false, done:true, message:'预览模式：蜂窝 payload 下载成功，已关闭 PDP'}});
+    if (url.indexOf('/ping') >= 0) return resp({{success:true, queued:false, running:url.indexOf('action=status') < 0, done:url.indexOf('action=status') >= 0, message:'预览模式：蜂窝 payload 下载成功，已关闭 PDP'}});
     if (url.indexOf('/modem') >= 0 || url.indexOf('/flight') >= 0 || url.indexOf('/ussd') >= 0 || url.indexOf('/at?') >= 0) {{
       return resp({{success:true, message:'预览模式：示例响应'}});
     }}

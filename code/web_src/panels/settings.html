@@ -1,7 +1,6 @@
-<div class="panel" id="panel-settings">
-      <h1 class="page-title">系统设置</h1>
-      <p class="page-subtitle">管理账号、设备时间、局域网域名与维护（重启 / 配置备份 / 固件升级）</p>
-      <div class="card-grid">
+<div class="panel" id="panel-settings" role="region" aria-label="系统设置">
+      <div class="compact-layout settings-layout">
+        <div class="compact-stack">
         <form action="/save" method="POST" id="mainForm">
         <input type="hidden" name="accountForm" value="1">
         <div class="card">
@@ -11,29 +10,6 @@
             <div class="form-group"><label class="form-label">管理账号</label><input class="form-input" type="text" name="webUser" value="%WEB_USER%" placeholder="admin"></div>
             <div class="form-group"><label class="form-label">管理密码</label><input class="form-input" type="password" name="webPass" value="%WEB_PASS%" placeholder="留空不修改密码"></div>
             <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存账号</button>
-          </div>
-        </div>
-        </form>
-        <form action="/save" method="POST">
-        <input type="hidden" name="tzForm" value="1">
-        <div class="card">
-          <div class="card-header">设备时间</div>
-          <div class="card-body">
-            <div class="form-group"><label class="form-label">时区</label><select class="form-select" name="tzOffsetMin">%TZ_OPTIONS%</select></div>
-            <div class="form-group"><label class="form-label">NTP 服务器</label><input class="form-input" type="text" name="ntpServer" value="%NTP%" placeholder="ntp.aliyun.com"></div>
-            <p class="form-hint">用于设备对时与本地时间显示；保号倒计时依赖对时，修改 NTP 需重启生效</p>
-            <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存时间</button>
-          </div>
-        </div>
-        </form>
-        <form action="/save" method="POST">
-        <input type="hidden" name="mdnsForm" value="1">
-        <div class="card">
-          <div class="card-header">局域网域名 (mDNS)</div>
-          <div class="card-body">
-            <div class="form-group"><label class="form-label">主机名</label><input class="form-input" type="text" name="mdnsHost" value="%MDNS_HOST%" placeholder="sms" maxlength="32"></div>
-            <p class="form-hint">通过 http://主机名.local 访问设备；多台设备请设置不同主机名，避免互相顶替。仅限小写字母、数字和连字符，保存后约 1 秒生效，无需重启</p>
-            <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存主机名</button>
           </div>
         </div>
         </form>
@@ -49,23 +25,45 @@
         </div>
         </form>
         <div class="card">
-          <div class="card-header">设备维护</div>
+          <div class="card-header">网络测试</div>
           <div class="card-body">
-            <div class="btn-row"><button class="btn btn-secondary" onclick="sysReboot()">重启设备</button><button class="btn btn-danger" onclick="sysFactory()">恢复出厂</button></div>
-            <p class="form-hint">恢复出厂将清空所有配置并重启（WiFi 凭据为固件内置，不受影响）</p>
-            <div class="result-box" id="sysResult"></div>
+            <label class="form-label" for="pingUrl">蜂窝 HTTP payload</label>
+            <div class="at-bar"><input class="form-input" type="url" id="pingUrl" placeholder="https://gg.incrafttime.top/api/payload?size=64342"><button type="button" class="btn btn-secondary btn-sm" id="pingBtn" onclick="doPing()">下载 payload</button></div>
+            <p class="form-hint">临时开启蜂窝数据下载，完成后自动关闭。</p>
+            <div class="result-box" id="pingResult" role="status" aria-live="polite"></div>
+            <label class="form-label settings-tool-label" for="ussdCode">USSD 查询</label>
+            <div class="at-bar"><input class="form-input" type="text" id="ussdCode" placeholder="如 *122# 或 *#1345#"><button type="button" class="btn btn-secondary btn-sm" onclick="sendUssd()">查询</button></div>
+            <p class="form-hint">用于查余额或保号，结果依运营商而定。</p>
+            <div class="result-box" id="ussdResult" role="status" aria-live="polite"></div>
           </div>
         </div>
+        </div>
+        <div class="compact-stack">
+        <form action="/save" method="POST">
+        <input type="hidden" name="tzForm" value="1">
         <div class="card">
-          <div class="card-header">配置备份 / 恢复</div>
+          <div class="card-header">设备时间</div>
           <div class="card-body">
-            <div class="btn-row"><button class="btn btn-secondary" onclick="doExport()">导出配置（脱敏）</button><button class="btn btn-secondary" onclick="doExportFull()">完整导出</button></div>
-            <p class="form-hint">默认导出会隐藏 WiFi、账号、SMTP 和推送密钥；完整导出含凭据，请妥善保管。恢复：粘贴备份内容后点导入</p>
-            <textarea class="form-textarea" id="importBox" rows="4" placeholder="粘贴备份内容到此处..."></textarea>
-            <div class="btn-row" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="doImport()">导入配置</button></div>
-            <div class="result-box" id="importResult"></div>
+            <div class="form-group"><label class="form-label">时区</label><select class="form-select" name="tzOffsetMin">%TZ_OPTIONS%</select></div>
+            <div class="form-group"><label class="form-label">NTP 服务器</label><input class="form-input" type="text" name="ntpServer" value="%NTP%" placeholder="ntp.aliyun.com"></div>
+            <p class="form-hint">用于设备对时与本地时间显示；保号倒计时依赖对时，修改 NTP 需重启生效</p>
+            <div class="btn-row"><button type="submit" class="btn btn-primary">保存时间</button><button type="button" class="btn btn-secondary" id="ntpBtn" onclick="ntpSync()">立即校时</button></div>
+            <div class="result-box" id="ntpResult" role="status" aria-live="polite"></div>
           </div>
         </div>
+        </form>
+        <form action="/save" method="POST">
+        <input type="hidden" name="mdnsForm" value="1">
+        <div class="card">
+          <div class="card-header">局域网域名 (mDNS)</div>
+          <div class="card-body">
+            <div class="form-group"><label class="form-label">主机名</label><input class="form-input" type="text" name="mdnsHost" value="%MDNS_HOST%" placeholder="sms" maxlength="32"></div>
+            <p class="form-hint">通过 http://主机名.local 访问设备；多台设备请设置不同主机名，避免互相顶替。仅限小写字母、数字和连字符，保存后约 1 秒生效，无需重启</p>
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存主机名</button>
+          </div>
+        </div>
+        </form>
+
         <div class="card">
             <div class="card-header">固件升级 (OTA)</div>
           <div class="card-body">
@@ -73,8 +71,46 @@
             <input class="form-input" type="text" id="otaSha256" placeholder="可选：固件 SHA-256（64 位十六进制）" style="margin-top:8px;">
             <div class="btn-row" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="doOta()">上传并升级</button></div>
             <p class="form-hint">上传编译生成的 .bin 固件；填写 SHA-256 时设备会校验固件内容，不匹配则拒绝启用；升级中请勿断电，约需 30-60 秒</p>
-            <div class="result-box" id="otaResult"></div>
+            <div class="result-box" id="otaResult" role="status" aria-live="polite"></div>
           </div>
+        </div>
+        </div>
+        <div class="compact-stack">
+        <div class="card">
+          <div class="card-header">设备维护</div>
+          <div class="card-body">
+            <div class="btn-row"><button class="btn btn-secondary" onclick="sysReboot()">重启设备</button><button class="btn btn-danger" onclick="sysFactory()">恢复出厂</button></div>
+            <p class="form-hint">恢复出厂将清空所有配置并重启（WiFi 凭据为固件内置，不受影响）</p>
+            <div class="result-box" id="sysResult" role="status" aria-live="polite"></div>
+            <div class="settings-tool-group">
+              <span class="form-label">4G 模组</span>
+              <div class="btn-row"><button type="button" class="btn btn-secondary" onclick="modemAction('restart')">模组软重启</button><button type="button" class="btn btn-secondary" onclick="modemAction('hardreset')">模组硬重启</button></div>
+              <div class="result-box" id="modemRstResult" role="status" aria-live="polite"></div>
+              <details class="task-help"><summary>软重启与硬重启的区别</summary><p class="form-hint">软重启发送 AT+CFUN=1,1，约 15 秒，模组不断电并重新注册；硬重启通过 EN 引脚断电再上电，约 10 秒，适用于模组卡死。两者都不重启 ESP32 主控。</p></details>
+            </div>
+            <div class="settings-tool-group">
+              <span class="form-label">飞行模式</span>
+              <div class="btn-row"><button type="button" class="btn btn-secondary" id="flightBtn" onclick="toggleFlightMode()">切换飞行模式</button><button type="button" class="btn btn-secondary" onclick="queryFlightMode()">查询状态</button></div>
+              <p class="form-hint">开启后关闭模组射频，无法收发短信。</p>
+              <div class="result-box" id="flightResult" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">配置备份 / 恢复</div>
+          <div class="card-body">
+            <div class="btn-row"><button class="btn btn-secondary" onclick="doExport()">导出配置（脱敏）</button><button class="btn btn-secondary" onclick="doExportFull()">完整导出</button></div>
+            <p class="form-hint">默认导出会隐藏 WiFi、账号、SMTP 和推送密钥；完整导出含凭据，请妥善保管。</p>
+            <details class="config-disclosure settings-import">
+              <summary>导入配置备份</summary>
+              <label class="form-label" for="importBox">备份内容</label>
+              <textarea class="form-textarea" id="importBox" rows="4" placeholder="粘贴备份内容到此处..."></textarea>
+              <div class="btn-row" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="doImport()">导入配置</button></div>
+              <div class="result-box" id="importResult" role="status" aria-live="polite"></div>
+            </details>
+          </div>
+        </div>
+
         </div>
       </div>
     </div>

@@ -3,6 +3,7 @@
     var webConfig = null, webConfigReq = null;
     var loadedPanels = {};
     var panelSeq = 0, currentPanel = '', panelFetchCtrl = null;
+    var messageSeq = 0, messageAbort = null;
 
     function ensureConfig(force) {
       if (force) { webConfig = null; webConfigReq = null; }
@@ -13,6 +14,7 @@
           return r.json();
         }).then(function(d) {
           webConfig = d || {};
+          if (typeof webConfig.tzOffsetMin === 'number') devTz = webConfig.tzOffsetMin;
           return webConfig;
         }).catch(function(e) {
           webConfigReq = null;  // 临时网络/认证失败不能污染后续面板加载
@@ -110,17 +112,76 @@
       var html = '';
       for (var i = 0; i < 5; i++) {
         var item = items[i] || {}, idx = String(i);
-        html += '<div class="sim-credential">';
-        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="text" autocapitalize="characters" spellcheck="false" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
+        html += '<details class="config-item sim-credential" id="simCredential' + idx + '"' + (item.iccid ? '' : ' hidden') + '>';
+        html += '<summary><span class="config-item-index">SIM ' + (i + 1) + '</span><span class="config-item-name" id="simCredentialName' + idx + '">' + htmlEsc(configItemName('sim', item.iccid)) + '</span></summary><div class="config-item-body">';
+        html += '<div class="form-group"><label class="form-label" for="simIccid' + idx + '">ICCID</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="text" id="simIccid' + idx + '" autocapitalize="characters" spellcheck="false" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" oninput="updateConfigItemName(\'sim\',' + i + ',this.value)" placeholder="输入完整 ICCID"></div>';
         html += '<div class="sim-credential-grid">';
         html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
         html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
         html += '<div class="form-group"><label>PUK</label><input class="form-input" type="password" name="sim' + idx + 'Puk" inputmode="numeric" minlength="8" maxlength="8" autocomplete="new-password" placeholder="' + (item.pukSet ? '已保存，留空不修改' : '8 位数字') + '"></div>';
         html += '<div class="form-group"><label>PUK 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PukMax" min="1" max="5" value="' + (item.pukMax || 1) + '"></div>';
         html += '</div><p class="form-hint">失败计数：PIN ' + (item.pinFailed || 0) + '/' + (item.pinMax || 1) + '，PUK ' + (item.pukFailed || 0) + '/' + (item.pukMax || 1) + '。修改对应凭据会清零该计数。</p>';
-        html += '<div class="btn-row"><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPin"> 保存时重置 PIN 计数</label><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPuk"> 保存时重置 PUK 计数</label></div></div>';
+        html += '<div class="btn-row"><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPin"> 保存时重置 PIN 计数</label><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPuk"> 保存时重置 PUK 计数</label></div>';
+        html += '<div class="config-item-actions"><button type="button" class="btn btn-danger btn-sm" onclick="removeSimCredential(' + i + ')">删除凭据</button></div></div></details>';
       }
+      var count = items.filter(function(item) { return !!item.iccid; }).length;
+      html += configListControls('sim', count);
       return html;
+    }
+    // 保留全部槽位字段参与提交：隐藏空槽位不会改变后端保存与删除契约。
+    function configItemName(kind, value) {
+      if (!value) return kind === 'sim' ? '待填写 ICCID' : '待填写网络名称';
+      return kind === 'sim' && value.length > 8 ? value.slice(0, 4) + ' ···· ' + value.slice(-4) : value;
+    }
+    function configListControls(kind, count) {
+      var label = kind === 'sim' ? 'SIM 凭据' : 'WiFi 网络';
+      return '<p class="config-empty" id="' + kind + 'ConfigEmpty"' + (count ? ' hidden' : '') + '>尚未添加' + label + '，需要时点击下方添加。</p>' +
+        '<button type="button" class="btn btn-secondary btn-add" id="' + kind + 'ConfigAdd" onclick="addConfigItem(\'' + kind + '\')"' + (count >= 5 ? ' disabled' : '') + '>+ 添加 ' + label + ' <span id="' + kind + 'ConfigCount">' + count + ' / 5</span></button>';
+    }
+    function updateConfigItemName(kind, index, value) {
+      var el = document.getElementById((kind === 'sim' ? 'simCredentialName' : 'wifiNetworkName') + index);
+      if (el) el.textContent = configItemName(kind, value);
+    }
+    function refreshConfigList(kind) {
+      var prefix = kind === 'sim' ? 'simCredential' : 'wifiNetwork', count = 0;
+      for (var i = 0; i < 5; i++) {
+        var item = document.getElementById(prefix + i);
+        if (item && !item.hidden) count++;
+      }
+      var btn = document.getElementById(kind + 'ConfigAdd'), empty = document.getElementById(kind + 'ConfigEmpty'), counter = document.getElementById(kind + 'ConfigCount');
+      if (btn) btn.disabled = count >= 5;
+      if (empty) empty.hidden = count > 0;
+      if (counter) counter.textContent = count + ' / 5';
+    }
+    function addConfigItem(kind) {
+      var prefix = kind === 'sim' ? 'simCredential' : 'wifiNetwork';
+      for (var i = 0; i < 5; i++) {
+        var item = document.getElementById(prefix + i);
+        if (!item || !item.hidden) continue;
+        item.hidden = false;
+        item.open = true;
+        refreshConfigList(kind);
+        var input = item.querySelector('input');
+        if (input) input.focus();
+        return;
+      }
+    }
+    function removeSimCredential(index) {
+      var item = document.getElementById('simCredential' + index);
+      if (!item) return;
+      item.querySelectorAll('input').forEach(function(input) {
+        if (input.type === 'checkbox') input.checked = false;
+        else if (input.type === 'number') input.value = '1';
+        else input.value = '';
+        if (input.type === 'password') input.placeholder = input.name.indexOf('Puk') >= 0 ? '8 位数字' : '4–8 位数字';
+      });
+      item.hidden = true;
+      item.open = false;
+      updateConfigItemName('sim', index, '');
+      refreshConfigList('sim');
+      var btn = document.getElementById('simConfigAdd');
+      if (btn) btn.focus();
+      showToast('凭据已移除，保存蜂窝设置后生效', 'info');
     }
     function buildPushChannels(chans) {
       chans = chans || [];
@@ -170,6 +231,7 @@
       return html;
     }
     function renderConfigTemplate(html) {
+      if (!/%([A-Z0-9_]{2,})%/.test(html)) return html;
       var c = webConfig || {};
       var map = {
         WEB_USER: htmlEsc(c.webUser || ''), WEB_PASS: htmlEsc(c.webPass || ''),
@@ -179,15 +241,20 @@
         SMTP_CHECK: c.emailConfigured ? '已配置' : '未配置', EMAIL_EN: checked(c.emailEnabled), PUSH_EN: checked(c.pushEnabled),
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
         NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
-        HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
+        HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: function(){ return buildTzOptions(c.tzOffsetMin); },
         SMS_HEALTH_CHECKED: checked(c.smsHealthEnabled), SMS_HEALTH_HOUR: String(c.smsHealthHour == null ? 10 : c.smsHealthHour), SMS_HEALTH_NOTIFY_CHECKED: checked(c.smsHealthNotify !== false),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
-        OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
-        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks), WIFI_TX_POWER_OPTIONS: buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm), SIM_CREDENTIALS: buildSimCredentials(c.simCredentials),
+        OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: function(){ return buildPushChannels(c.pushChannels); },
+        WIFI_NETWORKS: function(){ return buildWifiNetworks(c.wifiNetworks); }, WIFI_TX_POWER_OPTIONS: function(){ return buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm); }, SIM_CREDENTIALS: function(){ return buildSimCredentials(c.simCredentials); },
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
-      return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
+      // 只生成当前模板需要的表单，同一占位符重复出现时复用结果。
+      return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){
+        if (!Object.prototype.hasOwnProperty.call(map, k)) return m;
+        if (typeof map[k] === 'function') map[k] = map[k]();
+        return map[k];
+      });
     }
     function clearPanelTimers() {
       if (pingPollTimer) { clearTimeout(pingPollTimer); pingPollTimer = null; }
@@ -197,11 +264,14 @@
       if (latestOtpTimer) { clearTimeout(latestOtpTimer); latestOtpTimer = null; }
     }
     function cleanupPanelRuntime() {
+      messageSeq++;
+      if (messageAbort) { messageAbort.abort(); messageAbort = null; }
       stopLogPoll();
       stopStatusPoll();
       if (statusAbort) { try { statusAbort.abort(); } catch (e) {} statusAbort = null; }
       clearPanelTimers();
       stBuilt = false;
+      stDirty = false;
       if (pushTestTimers) {
         for (var k in pushTestTimers) {
           if (Object.prototype.hasOwnProperty.call(pushTestTimers, k) && pushTestTimers[k]) {
@@ -216,20 +286,21 @@
       if (name === 'log') { initLogPanel(); } else { stopLogPoll(); }
       if (name === 'overview') { loadStatus(); loadLatestOtp(); startStatusPoll(); } else { stopStatusPoll(); }
       if (name === 'inbox') loadMessages();
-      if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
+      if (name === 'keepalive' || name === 'settings') kaLoadStatus();
       if (name === 'keepalive') stLoadStatus();
       if (name === 'sim') { wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
       if (name === 'push') { for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); } setupChannels(); parseFwdRules(); renderRules(); }
       if (name === 'atterm') bindAtTerminal();
     }
     function activateNav(name) {
-      document.querySelectorAll('.sidebar-nav a').forEach(function(a) { a.classList.remove('active'); });
+      document.querySelectorAll('.sidebar-nav a').forEach(function(a) { a.classList.remove('active'); a.removeAttribute('aria-current'); });
       var a = document.querySelector('.sidebar-nav a[data-panel="' + name + '"]');
-      if (a) a.classList.add('active');
+      if (a) { a.classList.add('active'); a.setAttribute('aria-current', 'page'); }
     }
     function normalizePanelName(name) {
       name = String(name || '').replace(/^#/, '');
-      return document.querySelector('.sidebar-nav a[data-panel="' + name + '"]') ? name : 'overview';
+      if (name === 'diagnose') return 'settings';  // 旧诊断入口合并到系统设置，保留书签兼容。
+      return ['overview', 'sim', 'inbox', 'push', 'atterm', 'log', 'keepalive', 'settings'].indexOf(name) >= 0 ? name : 'overview';
     }
     function panelActive(name) { return currentPanel === name; }
     function panelFromHash() {
@@ -244,30 +315,32 @@
       if (panelFetchCtrl) { try { panelFetchCtrl.abort(); } catch (e) {} panelFetchCtrl = null; }
       function stale() { return seq !== panelSeq || currentPanel !== name; }
       activateNav(name);
+      // 概览通过 /status 获取实时数据，日志和终端无需下载配置；收件箱需要设备时区。
+      var configReady = ['overview', 'log', 'atterm'].indexOf(name) >= 0 ? Promise.resolve() : ensureConfig(false);
       if (loadedPanels[name]) {
-        ensureConfig(false).then(function() {
+        configReady.then(function() {
           if (stale()) return;
           host.innerHTML = renderConfigTemplate(loadedPanels[name]);
           var cachedPanel = document.getElementById('panel-' + name);
           if (cachedPanel) cachedPanel.classList.add('active');
           panelHook(name);
         }).catch(function(e) {
-          if (!stale()) host.innerHTML = '<div class="msg-empty">页面加载失败: ' + htmlEsc(String(e)) + '</div>';
+          if (!stale()) { host.innerHTML = ''; showToast('页面加载失败: ' + String(e), 'err'); }
         });
         return;
       }
       host.innerHTML = '<div class="msg-empty">加载中...</div>';
       var ctrl = window.AbortController ? new AbortController() : null;
       panelFetchCtrl = ctrl;
-      ensureConfig(false).then(function() {
-        if (stale()) return null;
-        var opt = { cache: 'no-store' };
-        if (ctrl) opt.signal = ctrl.signal;
-        return fetch('/ui?panel=' + encodeURIComponent(name) + '&v=' + encodeURIComponent(WEB_ASSET_HASH), opt).then(function(r){
+      // 模板与配置同时请求，带资源版本号的静态模板允许浏览器缓存。
+      var opt = { cache: 'default' };
+      if (ctrl) opt.signal = ctrl.signal;
+      var templateReady = fetch('/ui?panel=' + encodeURIComponent(name) + '&v=' + encodeURIComponent(WEB_ASSET_HASH), opt).then(function(r){
           if (!r.ok) throw new Error('panel ' + r.status);
           return r.text();
-        });
-      }).then(function(html) {
+      });
+      Promise.all([configReady, templateReady]).then(function(results) {
+        var html = results[1];
         if (stale() || html == null) return;
         if (panelFetchCtrl === ctrl) panelFetchCtrl = null;
         loadedPanels[name] = html;
@@ -278,7 +351,7 @@
       }).catch(function(e) {
         if (panelFetchCtrl === ctrl) panelFetchCtrl = null;
         if (stale() || (e && e.name === 'AbortError')) return;
-        host.innerHTML = '<div class="msg-empty">页面加载失败: ' + htmlEsc(String(e)) + '</div>';
+        host.innerHTML = ''; showToast('页面加载失败: ' + String(e), 'err');
       });
     }
     document.querySelectorAll('.sidebar-nav a').forEach(function(a) {
@@ -550,48 +623,43 @@
         var r = document.getElementById('pushTestResult' + idx);
         if (!r) return;
         if (d.queued || d.running) {
-          r.className = 'result-box result-loading';
-          r.textContent = d.message || '测试推送后台执行中...';
+          setResult(r, 'result-box result-loading', d.message || '测试推送后台执行中...');
           pushTestTimers[idx] = setTimeout(function(){ pollTestPush(idx); }, 3000);
           return;
         }
         pushTestDone(idx);
-        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error');
-        r.textContent = d.message || (d.success ? '测试推送已发送' : '测试推送失败');
+        setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message || (d.success ? '测试推送已发送' : '测试推送失败'));
       }).catch(function(e){
         pushTestDone(idx);
         var r = document.getElementById('pushTestResult' + idx);
         if (!r) return;
-        r.className = 'result-box result-error';
-        r.textContent = '状态查询失败: ' + e;
+        setResult(r, 'result-box result-error', '状态查询失败: ' + e);
       });
     }
     function testPush(idx, btn) {
       if (btn) { pushTestBtns[idx] = btn; btn.disabled = true; }  // 测试期间防重复点击
       var r = document.getElementById('pushTestResult' + idx);
-      r.className = 'result-box result-loading'; r.textContent = '测试推送已提交（请先保存配置）...';
+      setResult(r, 'result-box result-loading', '测试推送已提交（请先保存配置）...');
       csrfFetch('/testpush?ch=' + idx, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) {
-          r.textContent = d.message || '后台测试推送中...';
+          setResult(r, 'result-box result-loading', d.message || '后台测试推送中...');
           pollTestPush(idx);
         } else {
           pushTestDone(idx);
-          r.className = 'result-box result-error';
-          r.textContent = d.message || '任务启动失败';
+          setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message || (d.success ? '测试推送已发送' : '任务启动失败'));
         }
-      }).catch(function(e){ pushTestDone(idx); r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
+      }).catch(function(e){ pushTestDone(idx); setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
 
     // ---- USSD ----
     function sendUssd() {
       var code = document.getElementById('ussdCode').value.trim();
-      if (!code) return;
+      if (!code) { showToast('请输入 USSD 查询码', 'err'); return; }
       var r = document.getElementById('ussdResult');
-      r.className = 'result-box result-loading'; r.textContent = '查询中（最长约 20 秒）...';
+      setResult(r, 'result-box result-loading', '查询中（最长约 20 秒）...');
       csrfFetch('/ussd?code=' + encodeURIComponent(code), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
-        r.className = 'result-box ' + (d.success ? 'result-info' : 'result-error');
-        r.textContent = d.message || '(无响应)';
-      }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
+        setResult(r, 'result-box ' + (d.success ? 'result-info' : 'result-error'), d.message || '(无响应)');
+      }).catch(function(e){ setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
 
     // ---- Send SMS ----
@@ -601,7 +669,7 @@
       var modal = document.getElementById('smsModal'), phone = document.getElementById('smsPhone');
       if (!modal || !phone) return;
       var r = document.getElementById('smsSendResult');
-      if (r) { r.className = 'result-box'; r.textContent = ''; }
+      if (r) { setResult(r, 'result-box', ''); }
       modal.classList.add('show');
       phone.focus();
     }
@@ -615,15 +683,15 @@
       if (!phoneEl || !contentEl || !r) return;
       var phone = phoneEl.value.trim();
       var content = contentEl.value;
-      if (!phone) { r.className = 'result-box result-error'; r.textContent = '请输入目标号码'; return; }
-      if (!content.trim()) { r.className = 'result-box result-error'; r.textContent = '请输入短信内容'; return; }
+      if (!phone) { setResult(r, 'result-box result-error', '请输入目标号码'); return; }
+      if (!content.trim()) { setResult(r, 'result-box result-error', '请输入短信内容'); return; }
       var btn = document.getElementById('smsSendBtn'); btn.disabled = true;
-      r.className = 'result-box result-loading'; r.textContent = '提交中...';
+      setResult(r, 'result-box result-loading', '提交中...');
       var body = 'phone=' + encodeURIComponent(phone) + '&content=' + encodeURIComponent(content);
       csrfFetch('/sendsms', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
         .then(jsonOrThrow).then(function(d) {
           btn.disabled = false;
-          r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
+          setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
           if (d.success) {
             var cur = document.getElementById('smsContent');
             if (cur) { cur.value = ''; updateCount(cur); }
@@ -631,7 +699,7 @@
             if (smsBox === 'sent') setTimeout(loadMessages, 1200);
             setTimeout(closeSmsModal, 1000);
           }
-        }).catch(function(e){ btn.disabled = false; r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
+        }).catch(function(e){ btn.disabled = false; setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
 
     // ---- Cellular HTTP payload traffic ----
@@ -642,11 +710,11 @@
       if(!b||!r||!u)return;
       var url=(u.value||'').trim();
       b.disabled=true;b.textContent='...';
-      r.className='result-box result-loading';r.textContent='提交 payload 下载任务...';
+      setResult(r, 'result-box result-loading', '提交 payload 下载任务...');
       csrfFetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
-        if(d.success && d.running){ r.textContent='后台下载 payload 中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
-        else{ b.disabled=false;b.textContent='下载 payload'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
-      }).catch(function(e){b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='请求失败: '+e;});
+        if(d.success && d.running){ setResult(r, 'result-box result-loading', '后台下载 payload 中（会短暂开启蜂窝数据）...'); pollPingStatus(); }
+        else{ b.disabled=false;b.textContent='下载 payload'; setResult(r, 'result-box result-error', d.message||'任务启动失败'); }
+      }).catch(function(e){b.disabled=false;b.textContent='下载 payload';setResult(r, 'result-box result-error', '请求失败: '+e);});
     }
     function pollPingStatus(){
       if(pingPollTimer) clearTimeout(pingPollTimer);
@@ -654,18 +722,17 @@
         var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
         if(!b||!r)return;
         if(d.running){
-          r.className='result-box result-loading';
-          r.textContent='正在通过蜂窝网络下载 payload（后台执行，可刷新网页）...';
+          setResult(r, 'result-box result-loading', '正在通过蜂窝网络下载 payload（后台执行，可刷新网页）...');
           pingPollTimer=setTimeout(pollPingStatus,1000);
           return;
         }
         b.disabled=false;b.textContent='下载 payload';
-        if(d.success){r.className='result-box result-success';r.textContent='payload 下载完成 — '+(d.message||'完成');}
-        else{r.className='result-box result-error';r.textContent='payload 下载失败 — '+(d.message||'无结果');}
+        if(d.success){setResult(r, 'result-box result-success', 'payload 下载完成 — '+(d.message||'完成'));}
+        else{setResult(r, 'result-box result-error', 'payload 下载失败 — '+(d.message||'无结果'));}
       }).catch(function(e){
         var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
         if(!b||!r)return;
-        b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='状态查询失败: '+e;
+        b.disabled=false;b.textContent='下载 payload';setResult(r, 'result-box result-error', '状态查询失败: '+e);
       });
     }
 
@@ -673,42 +740,40 @@
     function wifiRestart(){
       if(!confirm('确定要重启WiFi吗？网页将暂时不可用。'))return;
       var r=document.getElementById('wifiResult');
-      r.className='result-box result-loading';r.textContent='WiFi 重启中（约5秒）...';
+      setResult(r, 'result-box result-loading', 'WiFi 重启中（约5秒）...');
       csrfFetch('/wifi?action=restart',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        r.className=d.success?'result-box result-success':'result-box result-error';
-        r.textContent=d.message;
-      }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
+        setResult(r, d.success?'result-box result-success':'result-box result-error', d.message);
+      }).catch(function(e){setResult(r, 'result-box result-error', '请求失败: '+e);});
     }
 
     // ---- Flight Mode ----
     function queryFlightMode(){
       var r=document.getElementById('flightResult');
-      r.className='result-box result-loading';r.textContent='查询中...';
+      setResult(r, 'result-box result-loading', '查询中...');
       fetch('/flight?action=query',{cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        if(d.success){r.className='result-box result-info';r.textContent=d.message;}
-        else{r.className='result-box result-error';r.textContent='查询失败: '+d.message;}
-      }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
+        if(d.success){setResult(r, 'result-box result-info', d.message);}
+        else{setResult(r, 'result-box result-error', '查询失败: '+d.message);}
+      }).catch(function(e){setResult(r, 'result-box result-error', '请求失败: '+e);});
     }
     function toggleFlightMode(){
       if(!confirm('确定要切换飞行模式吗？'))return;
       var b=document.getElementById('flightBtn'),r=document.getElementById('flightResult');
-      b.disabled=true;r.className='result-box result-loading';r.textContent='切换中...';
+      b.disabled=true;setResult(r, 'result-box result-loading', '切换中...');
       csrfFetch('/flight?action=toggle',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         b.disabled=false;
-        if(d.success){r.className='result-box result-success';r.textContent=d.message;}
-        else{r.className='result-box result-error';r.textContent='切换失败: '+d.message;}
-      }).catch(function(e){b.disabled=false;r.className='result-box result-error';r.textContent='请求失败: '+e;});
+        if(d.success){setResult(r, 'result-box result-success', d.message);}
+        else{setResult(r, 'result-box result-error', '切换失败: '+d.message);}
+      }).catch(function(e){b.disabled=false;setResult(r, 'result-box result-error', '请求失败: '+e);});
     }
 
     // ---- NTP 立即校时 ----
     function ntpSync(){
       var b=document.getElementById('ntpBtn'),r=document.getElementById('ntpResult');
       if(b){b.disabled=true;}
-      r.className='result-box result-loading';r.textContent='正在向 NTP 服务器校时...';
+      setResult(r, 'result-box result-loading', '正在向 NTP 服务器校时...');
       csrfFetch('/ntp',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        r.className='result-box '+(d.success?'result-success':'result-error');
-        r.textContent=(d.message||'')+(d.nowLocal?('　当前：'+d.nowLocal):'');
-      }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;})
+        setResult(r, 'result-box '+(d.success?'result-success':'result-error'), (d.message||'')+(d.nowLocal?('　当前：'+d.nowLocal):''));
+      }).catch(function(e){setResult(r, 'result-box result-error', '请求失败: '+e);})
         .finally(function(){if(b)b.disabled=false;});
     }
 
@@ -719,19 +784,19 @@
       var resultEl=document.getElementById('modemRstResult');   // 仅 restart/hardreset 调用本函数
       if(action==='hardreset'){
         if(!confirm('硬重启将断电重启模组，确定继续？'))return;
-        resultEl.className='result-box result-loading';resultEl.textContent='硬重启中（约10秒）...';
+        setResult(resultEl, 'result-box result-loading', '硬重启中（约10秒）...');
         csrfFetch('/modem?action=hardreset',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
-          resultEl.className='result-box result-success';resultEl.textContent=d.message+' — 稍后请手动查询信号确认恢复';
-        }).catch(function(e){resultEl.className='result-box result-error';resultEl.textContent='请求失败: '+e;});
+          setResult(resultEl, 'result-box result-success', d.message+' — 稍后请手动查询信号确认恢复');
+        }).catch(function(e){setResult(resultEl, 'result-box result-error', '请求失败: '+e);});
         return;
       }
-      resultEl.className='result-box result-loading';resultEl.textContent=name+'中...';
+      setResult(resultEl, 'result-box result-loading', name+'中...');
       csrfFetch('/modem?action='+action,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         if(d.success){
-          resultEl.className='result-box result-success';resultEl.textContent=name+'成功: '+d.message;
+          setResult(resultEl, 'result-box result-success', name+'成功: '+d.message);
         }
-        else{resultEl.className='result-box result-error';resultEl.textContent=name+'失败: '+d.message;}
-      }).catch(function(e){resultEl.className='result-box result-error';resultEl.textContent='请求失败: '+e;});
+        else{setResult(resultEl, 'result-box result-error', name+'失败: '+d.message);}
+      }).catch(function(e){setResult(resultEl, 'result-box result-error', '请求失败: '+e);});
     }
 
     // ---- AT Terminal ----
@@ -835,7 +900,7 @@
       fetch('/prevlog?_=' + Date.now(), { cache: 'no-store' }).then(textOrThrow).then(function(t) {
         el.textContent = t || '（空）';
       }).catch(function() {
-        el.textContent = '无法获取上次日志';
+        el.textContent = ''; showToast('无法获取上次日志', 'err');
       }).finally(function() { if (btn) btn.disabled = false; });
     }
     function clearCoredump(btn) {
@@ -856,7 +921,8 @@
     function clearLogUI() {
       logLines = [];
       renderLogView('');
-      setLogStatus('已清空，之后只显示新日志');
+      setLogStatus('共 0 条');
+      showToast('已清空显示，之后只显示新日志', 'ok');
     }
     function reloadLog() {
       logLines = [];
@@ -900,8 +966,9 @@
       }).catch(function() {
         if (!panelActive('log')) return;
         if (fullReload || el.textContent === '加载中...') {
-          renderLogView('无法获取日志');
-          setLogStatus('日志请求失败');
+          renderLogView('');
+          setLogStatus('共 0 条');
+          showToast('日志请求失败', 'err');
         }
       }).finally(function() {
         clearTimeout(timeoutId);
@@ -909,16 +976,36 @@
       });
     }
     // ---- Keep-Alive (保号) ----
+    var kaStatusSeq = 0;
     function kaLoadStatus() {
+      var requestSeq = ++kaStatusSeq;
+      var anchor = document.getElementById('kaForm') || document.getElementById('pingUrl');
+      var fillForm = !document.getElementById('kaFormFlag');
+      // 首次回填逐字段检查：请求在途期间已经修改的值由用户保留，其余字段正常加载。
+      var before = {};
+      ['kaEnabled', 'kaIntervalDays', 'kaAction', 'kaTarget', 'kaProfile', 'kaProfileSel', 'kaProfileCustom', 'kaUrl', 'pingUrl'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) before[id] = {el: el, value: id === 'kaEnabled' ? el.checked : el.value, edit: el._editVersion || 0};
+      });
+      function untouched(id) {
+        var item = before[id], el = document.getElementById(id);
+        return !!(item && item.el === el && item.edit === (el._editVersion || 0) && item.value === (id === 'kaEnabled' ? el.checked : el.value));
+      }
+      function fill(id, value) {
+        if (!untouched(id) || (id !== 'pingUrl' && !fillForm)) return;
+        if (id === 'kaEnabled') before[id].el.checked = !!value;
+        else before[id].el.value = value == null ? '' : value;
+      }
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
-        var el = document.getElementById('kaEnabled'); if (el) el.checked = !!d.enabled;
-        el = document.getElementById('kaIntervalDays'); if (el) el.value = d.intervalDays;
-        el = document.getElementById('kaAction'); if (el) el.value = d.action;
-        el = document.getElementById('kaTarget'); if (el) el.value = d.target || '';
-        profInit('kaProfile', d.profile || '');
+        if (requestSeq !== kaStatusSeq || anchor !== (document.getElementById('kaForm') || document.getElementById('pingUrl'))) return;
+        fill('kaEnabled', d.enabled);
+        fill('kaIntervalDays', d.intervalDays);
+        fill('kaAction', d.action);
+        fill('kaTarget', d.target || '');
+        if (fillForm && untouched('kaProfile') && untouched('kaProfileSel') && untouched('kaProfileCustom')) profInit('kaProfile', d.profile || '');
         var kaUrl = d.url || '';
-        el = document.getElementById('kaUrl'); if (el) el.value = kaUrl;
-        el = document.getElementById('pingUrl'); if (el) el.value = kaUrl;
+        fill('kaUrl', kaUrl);
+        fill('pingUrl', kaUrl);
         kaSyncHead();
         kaArmForm();  // 状态回填成功后才允许提交 kaForm，避免加载失败时点保存清掉已存保号配置
         var cd = document.getElementById('kaCountdown');
@@ -928,19 +1015,11 @@
         else cd.textContent = '上次 ' + (d.lastTimeLocal || '--').slice(0, 10) + ' · 约 ' + d.daysLeft + ' 天后';
       }).catch(function(){});
     }
-    // 保号卡：启用态高亮 + kaForm 安全 arm（与自定义任务 st* 同一套保护）
-    // 切换启用高亮：首次(面板切入后异步回填)时关掉过渡，避免卡片闪一下；之后的用户操作正常过渡
+    // 保号卡：启用状态与安全保存标志（与自定义任务 st* 同一套保护）
+    // 启用状态只更新语义类；任务卡表面保持稳定，避免切换开关时整卡闪色。
     function applyCardEnabled(card, enabled) {
       if (!card) return;
-      if (!card.dataset.animReady) {
-        card.classList.add('no-anim');
-        card.classList.toggle('enabled', enabled);
-        void card.offsetWidth;               // 强制重排，让无过渡样式立即落地
-        card.classList.remove('no-anim');
-        card.dataset.animReady = '1';
-      } else {
-        card.classList.toggle('enabled', enabled);
-      }
+      card.classList.toggle('enabled', enabled);
     }
     function kaSyncHead() {
       var en = document.getElementById('kaEnabled');
@@ -1030,7 +1109,13 @@
       var hidden = document.getElementById(hiddenId);
       if (!sel || !hidden) return;
       hidden.value = value || '';
+      var beforeSel = sel.value, beforeCustom = custom ? custom.value : '', beforeHidden = hidden.value;
+      var selEdit = sel._editVersion || 0, customEdit = custom ? custom._editVersion || 0 : 0;
       loadEsimOptions(function(options) {
+        // 下拉选项请求晚返回时，不覆盖用户已选择的卡或手动输入。
+        if (document.getElementById(hiddenId) !== hidden || hidden.value !== beforeHidden ||
+            sel.value !== beforeSel || selEdit !== (sel._editVersion || 0) ||
+            (custom && (custom.value !== beforeCustom || customEdit !== (custom._editVersion || 0)))) return;
         sel.innerHTML = '';
         function add(v, t) { var o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); }
         add('', '不切换（使用当前卡）');
@@ -1045,7 +1130,7 @@
 
     // ---- 自定义定时任务（复用推送通道卡片样式） ----
     var ST_MAX = 6;
-    var stTimer = null, stBuilt = false;
+    var stTimer = null, stBuilt = false, stDirty = false, stRevision = 0;
     function stBuildCard(i) {
       var card = document.createElement('div');
       card.className = 'push-channel st-task';
@@ -1069,14 +1154,14 @@
           '</div>' +
           '<div class="form-group"><label>目标（URL / 号码 / USSD 码；HTTP 留空用保号 URL）</label><input type="text" name="st' + i + 'Tgt" id="st' + i + 'Tgt" maxlength="128"></div>' +
           '<div class="form-group"><label>内容（推送 / 短信正文）</label><input type="text" name="st' + i + 'Pay" id="st' + i + 'Pay" maxlength="128" placeholder="如：记得给副卡充值"></div>' +
-          '<div class="form-group"><label>到期日发送时刻（设备本地时间，可留空沿用间隔时长）</label><input type="time" name="st' + i + 'Time" id="st' + i + 'Time"></div>' +
+          '<div class="form-group"><label for="st' + i + 'Time">到期日发送时刻</label><input class="form-input datetime-input" type="time" name="st' + i + 'Time" id="st' + i + 'Time"><p class="form-hint">设备本地时间，留空则沿用间隔时长。</p></div>' +
           '<div id="st' + i + 'Health">' +
             '<label><input type="checkbox" name="st' + i + 'Sys" id="st' + i + 'Sys"> 检测系统短信组件状态</label><br>' +
             '<label><input type="checkbox" name="st' + i + 'Reply" id="st' + i + 'Reply"> 检测短信收发功能（等待匹配回复）</label>' +
-            '<div class="form-row"><div class="form-group"><label>发件人正则</label><input name="st' + i + 'Sender" id="st' + i + 'Sender" maxlength="128" placeholder="如 ^10086$"></div>' +
-            '<div class="form-group"><label>正文正则</label><input name="st' + i + 'Body" id="st' + i + 'Body" maxlength="128" placeholder="如 余额为.*元"></div></div>' +
+            '<div class="form-row"><div class="form-group"><label for="st' + i + 'Sender">发件人正则</label><input type="text" class="form-input regex-input" name="st' + i + 'Sender" id="st' + i + 'Sender" maxlength="128" placeholder="如 ^10086$" spellcheck="false" autocapitalize="off" autocomplete="off"></div>' +
+            '<div class="form-group"><label for="st' + i + 'Body">正文正则</label><input type="text" class="form-input regex-input" name="st' + i + 'Body" id="st' + i + 'Body" maxlength="128" placeholder="如 余额为.*元" spellcheck="false" autocapitalize="off" autocomplete="off"></div></div>' +
             '<div class="form-group"><label>回复超时（秒，5–3600）</label><input type="number" name="st' + i + 'Timeout" id="st' + i + 'Timeout" min="5" max="3600" value="300"></div>' +
-            '<p class="hint">两个正则至少填写一个，任意一个匹配即成功（POSIX 扩展语法）。等待期间保持当前卡，结束后再切回；短信仍正常转发。首次启用只建立基准日。</p>' +
+            '<p class="form-hint">两个正则至少填写一个，任意一个匹配即成功（POSIX 扩展语法）。等待期间保持当前卡，结束后再切回；短信仍正常转发。首次启用只建立基准日。</p>' +
           '</div>' +
           '<div class="st-task-foot"><label><input type="checkbox" name="st' + i + 'Back" id="st' + i + 'Back" checked> 完成后切回原卡</label>' +
           '<span class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="stRun(' + i + ')">立即执行</button><button type="button" class="btn btn-secondary btn-sm" onclick="stResetBase(' + i + ')">基准日=今天</button><button type="button" class="btn btn-danger btn-sm" onclick="stRemove(' + i + ')">删除任务</button></span></div>' +
@@ -1108,22 +1193,29 @@
       if (btn) btn.style.display = visible >= ST_MAX ? 'none' : '';
       var hint = document.getElementById('stEmptyHint');
       if (hint) hint.style.display = visible ? 'none' : '';
+      var form = document.getElementById('stForm');
+      if (form) form.hidden = !visible && !stDirty;
     }
     function stAddTask() {
+      if (!document.getElementById('stFormFlag')) return;
       for (var i = 0; i < ST_MAX; i++) {
         var el = document.getElementById('stTask' + i);
         if (el && el.style.display === 'none') {
+          stDirty = true; stRevision++;
           var en = document.getElementById('st' + i + 'En'); if (en) en.checked = true;
           profInit('st' + i + 'Prof', '');
           stShow(i, true);
           stSyncHead(i);
           stSyncAction(i);
+          var name = document.getElementById('st' + i + 'Name');
+          if (name && name.focus) name.focus();
           return;
         }
       }
     }
     function stRemove(i) {
       if (!confirm('删除任务 ' + (i + 1) + '？点击“保存自定义任务”后生效。')) return;
+      stDirty = true; stRevision++;
       ['Name', 'Tgt', 'Pay', 'Prof', 'ProfCustom', 'Time', 'Sender', 'Body'].forEach(function(sfx){ var el = document.getElementById('st' + i + sfx); if (el) el.value = ''; });
       var el = document.getElementById('st' + i + 'Days'); if (el) el.value = 30;
       el = document.getElementById('st' + i + 'Act'); if (el) el.value = 0;
@@ -1156,12 +1248,14 @@
     function stCardUsed(t) { return !!(t.enabled || t.name || t.profile || t.target || t.payload); }
     function stLoadStatus(polling) {
       stBuildCards();
+      var form = document.getElementById('stForm');
+      var fillForm = !polling && !document.getElementById('stFormFlag');
       fetch('/schedtask?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
-        if (!panelActive('keepalive')) return;
+        if (!panelActive('keepalive') || form !== document.getElementById('stForm')) return;
         var tasks = Array.isArray(d.tasks) ? d.tasks : [];
         for (var i = 0; i < tasks.length && i < ST_MAX; i++) {
           var t = tasks[i];
-          if (!polling) {  // 轮询期间不覆盖正在编辑的表单
+          if (fillForm && !document.getElementById('stFormFlag')) {  // 仅首次成功加载回填，后续状态查询保留编辑
             var el = document.getElementById('st' + i + 'En'); if (el) el.checked = !!t.enabled;
             el = document.getElementById('st' + i + 'Back'); if (el) el.checked = !!t.switchBack;
             stSetVal('st' + i + 'Name', t.name); stSetVal('st' + i + 'Days', t.intervalDays);
@@ -1187,7 +1281,11 @@
             else cd.textContent = t.nextLocal ? ('下次 ' + t.nextLocal) : ('约 ' + t.daysLeft + ' 天后');
           }
         }
-        if (!polling) stArmForm();
+        if (!polling) {
+          stShow(0, document.getElementById('stTask0').style.display !== 'none');
+          stArmForm();
+          var add = document.getElementById('stAddBtn'); if (add) add.disabled = false;
+        }
         if (d.jobQueued || d.jobRunning) {
           showToast(d.jobMessage || '定时任务后台执行中…', 'loading');
         } else if (d.jobDone && polling) {
@@ -1325,11 +1423,14 @@
     }
     var statusTimer = null, statusPolling = false, statusSeq = 0, statusAbort = null, statusLoading = false, statusFailCount = 0, devEpochBase = 0, devEpochBaseMs = 0, latestStatusKey = '', statusFastUntil = 0, modemSampleUntil = 0;
     var modemSampleAwaitingResponse = false;
+    var modemNotifyRequested = false, modemNoticeKey = '';
     function modemSampleRequestFailed() {
       modemSampleAwaitingResponse = false;
       var btn = document.getElementById('modemRefreshButton');
       if (btn) { btn.disabled = false; btn.textContent = '重试刷新'; }
       ovSet('modemSampleResult', '刷新请求未确认，请重试或等待状态恢复');
+      if (modemNotifyRequested) showToast('刷新请求未确认，请重试或等待状态恢复', 'err');
+      modemNotifyRequested = false; modemNoticeKey = '';
     }
     function renderModemSampleState(d) {
       if (modemSampleAwaitingResponse) return;
@@ -1354,6 +1455,12 @@
         message = missing.length ? '采样已完成，' + missing.join('、') + '仍未读到；请查看日志中的查询结果，后台会继续重试' : '模组信息刷新完成';
       }
       ovSet('modemSampleResult', message);
+      var notice = document.getElementById('modemSampleResult'); if (notice) notice.hidden = true;
+      if (modemNotifyRequested && message && modemNoticeKey !== message) {
+        modemNoticeKey = message;
+        showToast(message, pending || running ? 'loading' : 'ok');
+        if (!pending && !running) modemNotifyRequested = false;
+      }
     }
     function deviceEpochNow() {
       if (!devEpochBase) return 0;
@@ -1436,6 +1543,7 @@
             (d.simUnlockMessage ? '；' + d.simUnlockMessage : '');
           simLock.className = 'result-box ' + (d.simState === 'ready' ? 'result-success' : (d.simState === 'pin' || d.simState === 'puk' ? 'result-error' : 'result-info'));
         }
+        renderNetworkConnection(d);
         // WiFi 详细信息卡片(独立卡，原"网络与SIM"里的 WiFi 行已移出)
         ovSet('wfSsid', d.ssid || '--');
         ovSet('wfIp', d.ip || '--'); ovSet('wfGw', d.gw || '--'); ovSet('wfMask', d.mask || '--');
@@ -1495,8 +1603,11 @@
     function stopStatusPoll() { statusPolling = false; if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; } }
     function refreshModemInfo(btn) {
       modemSampleAwaitingResponse = true;
+      modemNotifyRequested = true; modemNoticeKey = '';
       if (btn) { btn.disabled = true; btn.textContent = '提交刷新...'; }
       ovSet('modemSampleResult', '正在提交刷新请求');
+      var notice = document.getElementById('modemSampleResult'); if (notice) notice.hidden = true;
+      showToast('正在提交模组信息刷新请求', 'loading');
       modemSampleUntil = Date.now() + 15000;
       statusFastUntil = Date.now() + 15000;
       loadStatus(true);
@@ -1535,26 +1646,36 @@
     }
     function htmlEsc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
     function copyText(txt, el) {
-      try { if (navigator.clipboard) navigator.clipboard.writeText(txt); } catch (e) {}
-      if (el) { var o = el.textContent; el.textContent = '已复制'; setTimeout(function(){ el.textContent = o; }, 800); }
+      if (!navigator.clipboard) { showToast('当前浏览器不支持复制，请手动复制', 'err'); return; }
+      navigator.clipboard.writeText(txt).then(function(){ showToast('已复制', 'ok'); })
+        .catch(function(){ showToast('复制失败，请手动复制', 'err'); });
     }
     function loadMessages() {
       var box = document.getElementById('inboxList');
       if (!box) return;
       var reqBox = smsBox;
+      var seq = ++messageSeq;
+      if (messageAbort) messageAbort.abort();
+      var ctrl = window.AbortController ? new AbortController() : null;
+      messageAbort = ctrl;
       var sent = (smsBox === 'sent');
       // 有同类缓存先即时渲染(避免每次进入都空白"加载中")，再后台拉取刷新
       if (window.__msgFull && window.__msgBox === (sent ? 'sent' : 'recv')) renderMessages();
       else box.textContent = '加载中...';
-      fetch('/messages' + (sent ? '?box=sent&' : '?') + '_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
-        if (!panelActive('inbox') || reqBox !== smsBox) return;
+      var opt = {cache:'no-store'};
+      if (ctrl) opt.signal = ctrl.signal;
+      fetch('/messages' + (sent ? '?box=sent&' : '?') + '_=' + Date.now(), opt).then(jsonOrThrow).then(function(arr) {
+        if (seq !== messageSeq || !panelActive('inbox') || reqBox !== smsBox) return;
         if (!Array.isArray(arr)) arr = [];
         window.__msgFull = arr;                 // 全量缓存：搜索本地过滤，不再每按键请求
         window.__msgBox = sent ? 'sent' : 'recv';
         var cnt = document.getElementById(sent ? 'cntSent' : 'cntRecv');
         if (cnt) cnt.textContent = arr.length ? String(arr.length) : '';
         renderMessages();
-      }).catch(function() { if (document.getElementById('inboxList')) box.textContent = '无法获取短信'; });
+      }).catch(function(e) {
+        if (seq !== messageSeq || !panelActive('inbox') || (e && e.name === 'AbortError')) return;
+        if (document.getElementById('inboxList') === box) { box.textContent = ''; showToast('无法获取短信', 'err'); }
+      }).then(function(){ if (messageAbort === ctrl) messageAbort = null; });
     }
     // 仅用缓存过滤+渲染(搜索框输入调用，零网络请求，瞬时响应)
     function renderMessages() {
@@ -1563,14 +1684,15 @@
       var sent = (window.__msgBox === 'sent');
       var qEl = document.getElementById('smsSearch');
       var q = (qEl && qEl.value || '').trim().toLowerCase();
-      var arr = (window.__msgFull || []).slice();
+      var arr = window.__msgFull || [];
       if (q) arr = arr.filter(function(m){ var who = sent ? (m.target||'') : (m.sender||''); return (who + ' ' + (m.text||'')).toLowerCase().indexOf(q) >= 0; });
       box.innerHTML = '';
+      window.__msgCache = arr;
       if (!arr.length) {
         var em = document.createElement('div'); em.className = 'msg-empty';
         em.textContent = q ? ('未匹配 “' + q + '”') : (sent ? '(暂无已发送短信)' : '(暂无短信)'); box.appendChild(em); return;
       }
-      window.__msgCache = arr;
+      var fragment = document.createDocumentFragment();
       arr.forEach(function(m) {
           var d = document.createElement('div'); d.className = 'msg'; d.style.cursor = 'pointer'; d.onclick = function(){ openMsgDrawer(m.id); };
           var h = document.createElement('div'); h.className = 'msg-head';
@@ -1578,7 +1700,7 @@
           var right = document.createElement('span'); right.style.display = 'flex'; right.style.gap = '6px'; right.style.alignItems = 'center';
           var otp = sent ? '' : otpExtract(m.text || '');
           if (otp) {
-            var oc = document.createElement('span'); oc.className = 'msg-chip otp'; oc.textContent = '⎘ ' + otp; oc.title = '点击复制验证码';
+            var oc = document.createElement('span'); oc.className = 'msg-chip otp'; oc.textContent = otp; oc.title = '点击复制验证码';
             oc.onclick = function(ev){ ev.stopPropagation(); copyText(otp, oc); };
             right.appendChild(oc);
           }
@@ -1599,27 +1721,28 @@
           var body = htmlEsc(m.text || '');
           if (otp) body = body.replace(otp, '<mark>' + otp + '</mark>');  // otp 为纯数字，先转义再高亮，无注入风险
           b.innerHTML = body;
-          d.appendChild(h); d.appendChild(t); d.appendChild(b); box.appendChild(d);
+          d.appendChild(h); d.appendChild(t); d.appendChild(b); fragment.appendChild(d);
         });
+      box.appendChild(fragment);
     }
 
     // ---- System maintenance ----
     function sysReboot() {
       if (!confirm('确定重启设备？约 15 秒后恢复。')) return;
       var r = document.getElementById('sysResult');
-      r.className = 'result-box result-loading'; r.textContent = '正在重启...';
+      setResult(r, 'result-box result-loading', '正在重启...');
       csrfFetch('/reboot', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        r.className = 'result-box result-success'; r.textContent = d.message;
-      }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请稍后刷新页面'; });
+        setResult(r, 'result-box result-success', d.message);
+      }).catch(function(){ setResult(r, 'result-box result-info', '设备正在重启，请稍后刷新页面'); });
     }
     function sysFactory() {
       if (!confirm('确定恢复出厂设置？将清空所有配置并重启，不可撤销！')) return;
       if (!confirm('再次确认：账号/邮件/推送/保号等全部配置都会被清除！')) return;
       var r = document.getElementById('sysResult');
-      r.className = 'result-box result-loading'; r.textContent = '正在清除配置并重启...';
+      setResult(r, 'result-box result-loading', '正在清除配置并重启...');
       csrfFetch('/factory', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        r.className = 'result-box result-success'; r.textContent = d.message;
-      }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请稍后用默认账号登录'; });
+        setResult(r, 'result-box result-success', d.message);
+      }).catch(function(){ setResult(r, 'result-box result-info', '设备正在重启，请稍后用默认账号登录'); });
     }
 
     // ---- eSIM 本地管理 ----
@@ -1657,6 +1780,7 @@
       var confirmationInput = document.getElementById('esimConfirmationCode');
       var confirmationSubmit = document.getElementById('esimConfirmationSubmitBtn');
       if (!host || !matching || !status || !start) return;
+      status.hidden = true;  // 下载过程由统一 toast 反馈，卡片保留安装信息与确认码输入。
       host.textContent = d.installHost || '--';
       matching.textContent = d.installMatchingIdMasked || '--';
       var busy = !!(d.jobQueued || d.jobRunning);
@@ -1818,7 +1942,7 @@
     function esimRefresh() { esimStart('refresh'); }
     function esimRun(action, id, nick) {
       id = String(id || '').trim(); nick = String(nick || '').trim();
-      if (!id) { alert('请先选择 Profile'); return; }
+      if (!id) { showToast('请先选择 Profile', 'err'); return; }
       if (action === 'disable' && !confirm('确定禁用该 eSIM Profile？')) return;
       if (action === 'switch' && !confirm('确定切换/启用该 eSIM Profile？模组可能短暂掉线。')) return;
       if (action === 'delete' && !confirm('确定删除该 eSIM Profile？\n\n' + esimMaskedId(id) + '\n\n删除后需要重新下载安装配置文件。')) return;
@@ -1833,6 +1957,18 @@
     }
 
     // ---- WiFi settings ----
+    function renderNetworkConnection(d) {
+      var card = document.getElementById('networkCurrent');
+      if (!card) return;
+      ovSet('networkSsid', d.apMode ? '配网热点已开启' : (d.ssid || '尚未连接 WiFi'));
+      ovSet('networkConnection', d.apMode ? '添加 WiFi 网络，让设备接入互联网' : (d.wifiConnected ? '已连接 · ' + (d.ip || '--') + ' · ' + (d.rssi || '--') + ' dBm' : '连接中，请稍候'));
+      // 配网模式只自动展开一次，轮询不会打断用户手动收起。
+      var details = document.getElementById('wifiConnectDetails');
+      if (details && d.apMode && !details.dataset.provisioningShown) {
+        details.open = true;
+        details.dataset.provisioningShown = '1';
+      }
+    }
     // 扫描结果统一回填上方配网下拉：无论扫描由“扫描”按钮还是历史列表聚焦触发
     function wifiScanFillSelect(arr) {
       var sel = document.getElementById('wifiScanSel');
@@ -1861,19 +1997,25 @@
     }
     function wifiSave() {
       var s = document.getElementById('wifiSsidIn').value.trim();
-      if (!s) { alert('请输入 WiFi 名称'); return; }
+      if (!s) {
+        var error = document.getElementById('wifiCfgResult');
+        setResult(error, 'result-box result-error', '请输入 WiFi 名称');
+        document.getElementById('wifiSsidIn').focus();
+        return;
+      }
       if (!confirm('保存并重启接入 “' + s + '”？设备将重启约 15-20 秒。')) return;
       var r = document.getElementById('wifiCfgResult');
-      r.className = 'result-box result-loading'; r.textContent = '保存中，设备即将重启...';
+      setResult(r, 'result-box result-loading', '保存中，设备即将重启...');
       var body = 'ssid=' + encodeURIComponent(s) + '&pass=' + encodeURIComponent(document.getElementById('wifiPassIn').value);
       csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body}).then(jsonOrThrow).then(function(d) {
-        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
-      }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请连接目标 WiFi 后重新访问设备'; });
+        setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
+      }).catch(function(){ setResult(r, 'result-box result-info', '设备正在重启，请连接目标 WiFi 后重新访问设备'); });
     }
     function wifiPrefill() {
       fetch('/status?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         var ssidIn = document.getElementById('wifiSsidIn');
         if (ssidIn && d.ssid && !d.apMode && !ssidIn.value) ssidIn.value = d.ssid;
+        renderNetworkConnection(d);
       }).catch(function(){});
     }
     function buildWifiNetworks(nets) {
@@ -1882,21 +2024,31 @@
       for (var i = 0; i < 5; i++) {
         var n = nets[i] || {};
         var has = !!n.ssid;
-        html += '<div class="form-group"><label class="form-label">网络 ' + (i + 1) + (i === 0 ? '（最近配网）' : '') + '</label>';
-        html += '<div style="display:flex;gap:6px;align-items:center;">';
+        html += '<details class="config-item" id="wifiNetwork' + i + '"' + (has ? '' : ' hidden') + '>';
+        html += '<summary><span class="config-item-index">WiFi ' + (i + 1) + '</span><span class="config-item-name" id="wifiNetworkName' + i + '">' + htmlEsc(configItemName('wifi', n.ssid)) + '</span></summary><div class="config-item-body">';
+        html += '<div class="form-group"><label class="form-label" for="wifiNetSsid' + i + '">WiFi 名称 (SSID)</label>';
         html += '<div class="wifi-suggest-wrap">';
-        html += '<input class="form-input" type="text" name="wifi' + i + 'Ssid" id="wifiNetSsid' + i + '" value="' + htmlEsc(n.ssid || '') + '" placeholder="SSID（留空 = 未使用）" maxlength="32" autocomplete="off" onfocus="wifiSuggestOpen(' + i + ')" oninput="wifiSuggestOpen(' + i + ')" onblur="wifiSuggestClose(' + i + ')">';
+        html += '<input class="form-input" type="text" name="wifi' + i + 'Ssid" id="wifiNetSsid' + i + '" value="' + htmlEsc(n.ssid || '') + '" placeholder="选择附近网络或手动输入" maxlength="32" autocomplete="off" onfocus="wifiSuggestOpen(' + i + ')" oninput="updateConfigItemName(\'wifi\',' + i + ',this.value);wifiSuggestOpen(' + i + ')" onblur="wifiSuggestClose(' + i + ')">';
         html += '<div class="wifi-suggest" id="wifiSuggest' + i + '" style="display:none;"></div></div>';
-        html += '<button type="button" class="btn btn-secondary btn-sm" onclick="wifiNetClear(' + i + ')">删除</button></div>';
-        html += '<input class="form-input" type="password" name="wifi' + i + 'Pass" id="wifiNetPass' + i + '" value="" placeholder="' + (n.passSet ? '留空保持原密码' : (has ? '开放网络（无密码）' : '密码')) + '" maxlength="64" style="margin-top:4px;">';
         html += '</div>';
+        html += '<div class="form-group"><label class="form-label" for="wifiNetPass' + i + '">WiFi 密码</label><input class="form-input" type="password" name="wifi' + i + 'Pass" id="wifiNetPass' + i + '" value="" placeholder="' + (n.passSet ? '留空保持原密码' : '开放网络留空') + '" maxlength="64"></div>';
+        html += '<div class="config-item-actions"><button type="button" class="btn btn-danger btn-sm" onclick="wifiNetClear(' + i + ')">删除网络</button></div></div></details>';
       }
+      html += configListControls('wifi', nets.filter(function(n) { return !!n.ssid; }).length);
       return html;
     }
     function wifiNetClear(i) {
       var s = document.getElementById('wifiNetSsid' + i), p = document.getElementById('wifiNetPass' + i);
       if (s) s.value = '';
       if (p) { p.value = ''; p.placeholder = '密码'; }
+      wifiSuggestClose(i);
+      var item = document.getElementById('wifiNetwork' + i);
+      if (item) { item.hidden = true; item.open = false; }
+      updateConfigItemName('wifi', i, '');
+      refreshConfigList('wifi');
+      var btn = document.getElementById('wifiConfigAdd');
+      if (btn) btn.focus();
+      showToast('网络已移除，保存 WiFi 列表后生效', 'info');
     }
     // SSID 扫描候选：首次聚焦自动扫描一次并缓存，点“扫描”按钮会刷新缓存
     var wifiScanCache = null, wifiScanReq = null;
@@ -1938,6 +2090,7 @@
           d.addEventListener('mousedown', function(e) {  // mousedown 先于 blur，选中不会被关闭吞掉
             e.preventDefault();
             inp.value = w.ssid;
+            updateConfigItemName('wifi', i, w.ssid);
             box.style.display = 'none';
           });
           box.appendChild(d);
@@ -1959,28 +2112,28 @@
     }
     function doImport() {
       var t = document.getElementById('importBox').value;
-      if (!t.trim()) { return; }
+      if (!t.trim()) { showToast('请先粘贴配置备份', 'err'); return; }
       if (!confirm('确定导入配置？将覆盖当前设置。')) return;
       var r = document.getElementById('importResult');
-      r.className = 'result-box result-loading'; r.textContent = '导入中...';
+      setResult(r, 'result-box result-loading', '导入中...');
       csrfFetch('/import', {method:'POST', cache:'no-store', headers:{'Content-Type':'text/plain'}, body:t}).then(jsonOrThrow).then(function(d){
-        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
-      }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
+        setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
+      }).catch(function(e){ setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
     function doOta() {
       var f = document.getElementById('otaFile').files[0];
       var shaEl = document.getElementById('otaSha256');
       var sha256 = (shaEl && shaEl.value ? shaEl.value : '').trim().toLowerCase();
-      if (!f) { alert('请先选择 .bin 固件文件'); return; }
-      if (sha256 && !/^[0-9a-f]{64}$/.test(sha256)) { alert('SHA-256 应为 64 位十六进制字符串'); return; }
+      if (!f) { showToast('请先选择 .bin 固件文件', 'err'); return; }
+      if (sha256 && !/^[0-9a-f]{64}$/.test(sha256)) { showToast('SHA-256 应为 64 位十六进制字符串', 'err'); return; }
       if (!confirm('确定升级固件？升级过程中请勿断电。')) return;
       var r = document.getElementById('otaResult');
-      r.className = 'result-box result-loading'; r.textContent = '上传中，请勿断电...';
+      setResult(r, 'result-box result-loading', '上传中，请勿断电...');
       var fd = new FormData(); fd.append('update', f, f.name);
       var url = '/update' + (sha256 ? ('?sha256=' + encodeURIComponent(sha256)) : '');
       csrfFetch(url, {method:'POST', cache:'no-store', body:fd}).then(jsonOrThrow).then(function(d){
-        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
-      }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备可能正在重启，请稍后刷新'; });
+        setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
+      }).catch(function(){ setResult(r, 'result-box result-info', '设备可能正在重启，请稍后刷新'); });
     }
 
     // ---- 转发规则 可视化搭建器 ----
@@ -2013,7 +2166,7 @@
       if (!fwdRules.length) { box.innerHTML = '<div class="msg-empty">暂无规则。点“添加规则”新建；不加规则时短信转发到全部启用通道。</div>'; return; }
       box.innerHTML = '';
       fwdRules.forEach(function(r, i) {
-        var d = document.createElement('div'); d.className = 'push-channel enabled'; d.style.marginBottom = '10px';
+        var d = document.createElement('div'); d.className = 'push-channel rule-card';
         var typeOpts = [['kw','关键词(子串)'],['re','正文正则'],['from','发件人正则']].map(function(o){return '<option value="'+o[0]+'"'+(r.type===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
         var chans = ''; for (var c = 1; c <= 5; c++) chans += '<label style="margin-right:12px;font-size:12px;white-space:nowrap;"><input type="checkbox" data-ch="'+c+'"'+(r.chans[c]?' checked':'')+(r.drop?' disabled':'')+'> '+htmlEsc(chanName(c))+'</label>';
         d.innerHTML =
@@ -2023,8 +2176,8 @@
           '<button type="button" class="btn btn-secondary btn-sm" data-a="up">↑</button>'+
           '<button type="button" class="btn btn-secondary btn-sm" data-a="dn">↓</button>'+
           '<button type="button" class="btn btn-danger btn-sm" data-a="del">删除</button></span></div>'+
-          '<div class="form-row"><div class="form-group" style="flex:0 0 132px;"><label class="form-label">匹配方式</label><select class="form-select rType">'+typeOpts+'</select></div>'+
-          '<div class="form-group"><label class="form-label">模式（关键词 / 正则）</label><input class="form-input rPat" placeholder="如  验证码   或   ^(10086|10010)"></div></div>'+
+          '<div class="rule-fields"><div class="form-group"><label class="form-label" for="ruleType'+i+'">匹配方式</label><select class="form-select rType" id="ruleType'+i+'">'+typeOpts+'</select></div>'+
+          '<div class="form-group"><label class="form-label" for="rulePattern'+i+'">关键词 / 正则表达式</label><textarea class="form-textarea regex-input rPat" id="rulePattern'+i+'" rows="2" placeholder="如 验证码 或 ^(10086|10010)$" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea></div></div>'+
           '<div class="form-group"><label class="form-label">命中后</label>'+
           '<label style="margin-right:14px;font-size:12px;color:var(--error);"><input type="checkbox" class="rDrop"'+(r.drop?' checked':'')+'> 丢弃(不转发)</label>'+
           '<label style="margin-right:12px;font-size:12px;"><input type="checkbox" class="rEmail"'+(r.email?' checked':'')+(r.drop?' disabled':'')+'> 邮件</label>'+chans+'</div>';
@@ -2062,8 +2215,8 @@
       var from = (document.getElementById('rtFrom').value || '').trim();
       var text = document.getElementById('rtText').value || '';
       var r = document.getElementById('rtResult');
-      if (!text && !from) { r.className = 'result-box result-error'; r.textContent = '请先填写测试发件人或正文'; return; }
-      r.className = 'result-box result-loading'; r.textContent = '按设备实际规则测试中...';
+      if (!text && !from) { setResult(r, 'result-box result-error', '请先填写测试发件人或正文'); return; }
+      setResult(r, 'result-box result-loading', '按设备实际规则测试中...');
       var raw = (document.getElementById('forwardRulesRaw') || {}).value || '';
       var body = new URLSearchParams();
       body.append('rules', raw); body.append('sender', from); body.append('text', text);
@@ -2071,8 +2224,7 @@
         .then(jsonOrThrow).then(function(result) {
         var index = result.ruleIndex || 0;
         if (result.matched && result.drop) {
-          r.className = 'result-box result-error';
-          r.textContent = '命中规则 ' + index + ' → 丢弃(不转发)';
+          setResult(r, 'result-box result-error', '命中规则 ' + index + ' → 丢弃(不转发)');
           return;
         }
         var selected = {};
@@ -2085,11 +2237,9 @@
         var prefix = result.matched ? ('命中规则 ' + index + ' → ') : '未命中任何规则 → ';
         var msg = prefix + (d.out.length ? (result.matched ? '实际转发到：' : '按默认策略实际转发到：') + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
         if (d.skipped.length) msg += '；跳过：' + d.skipped.join('、');
-        r.className = 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error');
-        r.textContent = msg;
+        setResult(r, 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error'), msg);
       }).catch(function(e) {
-        r.className = 'result-box result-error';
-        r.textContent = '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果');
+        setResult(r, 'result-box result-error', '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果'));
       });
     }
 
@@ -2145,17 +2295,17 @@
     });
     function resendMsg(id) {
       var r = document.getElementById('drawerRes'); if (!r) return;
-      r.className = 'result-box result-loading'; r.textContent = '重发中...';
+      setResult(r, 'result-box result-loading', '重发中...');
       csrfFetch('/resend?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
-        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
-      }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
+        setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
+      }).catch(function(e){ setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
     function deleteMsg(id) {
       if (!confirm('确定删除这条短信？')) return;
       csrfFetch('/delete?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
-        if (d.success) { closeMsgDrawer(); loadMessages(); }
-        else { var r = document.getElementById('drawerRes'); if (r) { r.className = 'result-box result-error'; r.textContent = d.message; } }
-      }).catch(function(e){ var r = document.getElementById('drawerRes'); if (r) { r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; } });
+        if (d.success) { showToast(d.message || '短信已删除', 'ok'); closeMsgDrawer(); loadMessages(); }
+        else { var r = document.getElementById('drawerRes'); if (r) { setResult(r, 'result-box result-error', d.message); } }
+      }).catch(function(e){ var r = document.getElementById('drawerRes'); if (r) { setResult(r, 'result-box result-error', '请求失败: ' + e); } });
     }
     // ---- 概览：最新接收 / 验证码 hero ----
     var latestOtpLoading = false, latestOtpTimer = null;
@@ -2194,20 +2344,35 @@
     document.addEventListener('DOMContentLoaded', function() {
       switchPanel(panelFromHash());
     });
-    // ---- 右上角 toast：统一承载"会撑大卡片"的临时提示（下发/入队/执行结果等）----
-    // kind: 'ok'(绿) | 'err'(红) | 'info'(中性) | 'loading'(琥珀，常驻直到被下一条替换)
+    // 操作反馈集中到右上角；保留原结果节点作为状态缓存，避免改变已有 ID 契约。
+    function setResult(el, className, message) {
+      if (el) { el.className = className; el.textContent = message || ''; el.hidden = true; }
+      if (!message) return;
+      var kind = /result-error/.test(className) ? 'err' : /result-loading/.test(className) ? 'loading' : /result-info/.test(className) ? 'info' : 'ok';
+      showToast(message, kind);
+    }
+    // ---- 统一右上角 toast：成功、失败、过程与校验提示共用，支持关闭与长文本。 ----
     function showToast(msg, kind) {
       kind = kind || 'ok';
       var t = document.getElementById('saveToast');
-      if (!t) { t = document.createElement('div'); t.id = 'saveToast'; document.body.appendChild(t); }
-      // loading 态连续刷新时只换文案、不重放入场动画，避免每次轮询都闪一下
-      var keepAnim = (kind === 'loading' && t.classList.contains('show') && t.classList.contains('loading'));
-      t.textContent = msg || '';
+      if (!t) {
+        t = document.createElement('div'); t.id = 'saveToast';
+        var icon = document.createElement('span'); icon.className = 'toast-icon'; icon.setAttribute('aria-hidden', 'true');
+        var message = document.createElement('span'); message.className = 'toast-message';
+        var close = document.createElement('button'); close.type = 'button'; close.className = 'toast-close'; close.textContent = '×'; close.setAttribute('aria-label', '关闭提示');
+        close.onclick = function(){ clearTimeout(window.__toastT); t.classList.remove('show'); };
+        t.appendChild(icon); t.appendChild(message); t.appendChild(close);
+        t._icon = icon; t._message = message;
+        document.body.appendChild(t);
+      }
+      t.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+      t.setAttribute('aria-atomic', 'true');
+      t._icon.textContent = {ok: '✓', err: '!', info: 'i', loading: '…'}[kind] || 'i';
+      t._message.textContent = String(msg || '').replace(/^[✓✗]\s*/, '');
       t.className = 'save-toast ' + kind + ' show';
-      if (!keepAnim) { t.classList.remove('show'); void t.offsetWidth; t.classList.add('show'); }
       clearTimeout(window.__toastT);
-      // loading 不自动消失（等成功/失败结果来替换）；其余 2.6s 后淡出
-      if (kind !== 'loading') window.__toastT = setTimeout(function() { t.classList.remove('show'); }, 2600);
+      // 过程提示不自动消失；失败与长结果保留更久，避免尚未读完就隐藏。
+      if (kind !== 'loading') window.__toastT = setTimeout(function() { t.classList.remove('show'); }, kind === 'err' || String(msg).length > 120 ? 8000 : 5000);
     }
     // ---- 设置表单 AJAX 原地保存：拦截所有 /save 表单，不再整页跳转 ----
     function showSaved(ok, msg) {
@@ -2226,6 +2391,12 @@
         throw e;
       });
     }
+    // 记录用户编辑，即使开关来回切换回原值，迟到的状态请求也不应重写它。
+    function markEditedField(e) {
+      if (e.target) e.target._editVersion = (e.target._editVersion || 0) + 1;
+    }
+    document.addEventListener('input', markEditedField, true);
+    document.addEventListener('change', markEditedField, true);
     document.addEventListener('submit', function(e) {
       var f = e.target;
       if (!f || f.getAttribute('action') !== '/save') return;
@@ -2243,6 +2414,7 @@
       fd.forEach(function(v, k){ body.append(k, v); });  // ESP32 WebServer 对 multipart 大表单会卡/超时致"网络错误"
       body.append('ajax', '1');
       var passChanged = (fd.get('webPass') || '') !== '';
+      var savedStRevision = stRevision;
       var btn = f.querySelector('button[type="submit"]'), old = btn ? btn.textContent : '';
       if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
       var attempt = function(n) {
@@ -2252,6 +2424,10 @@
             return;
           }
           return ensureConfig(true).catch(function(){ return null; }).then(function() {
+            if (f.id === 'stForm' && savedStRevision === stRevision && f === document.getElementById('stForm')) {
+              stDirty = false;
+              stShow(0, document.getElementById('stTask0').style.display !== 'none');
+            }
             showSaved(true, passChanged ? '✓ 已保存，账号密码已更新' : '✓ 已保存');
           });
         }).catch(function() {

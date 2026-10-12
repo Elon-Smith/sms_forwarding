@@ -358,7 +358,12 @@ static esp_err_t handle_ui_panel(httpd_req_t* req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Unknown panel");
         return ESP_OK;
     }
-    return send_gzip_asset(req, *asset, "no-store, max-age=0");
+    // 模板不含配置数据，只有与固件匹配的版本 URL 才能长期缓存；旧版本必须重新校验。
+    char version[24] = {};
+    const bool version_matches = httpd_query_key_value(query, "v", version, sizeof(version)) == ESP_OK &&
+                                 strcmp(version, WEB_ASSET_HASH) == 0;
+    return send_gzip_asset(req, *asset, version_matches ? "private, max-age=31536000, immutable" :
+                                                      "private, no-cache, max-age=0");
 }
 
 static esp_err_t handle_status(httpd_req_t* req)
@@ -1679,26 +1684,35 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     IdfFormFields fields = parse_urlencoded(body);
     std::string ssid_s = field_text(fields, "ssid");
     std::string pass_s = field_text(fields, "pass");
-    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s);
+    std::string mdns_s = field_text(fields, "mdnsHost");
+    // 控制台与旧配网页未提交 mDNS 字段时，保留设备已有主机名。
+    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s, has_field(fields, "mdnsHost") ? &mdns_s : nullptr);
     set_json_no_cache(req);
     if (err != ESP_OK) {
-        std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
+        std::string msg = "{\"success\":false,\"message\":\"WiFi 或 mDNS 配置保存失败\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
+    char mdns_host[33] = {};
+    idf_config_copy_mdns_host(mdns_host, sizeof(mdns_host));
+    std::string msg = "{\"success\":true,";
+    json_prop(msg, "mdnsHost", mdns_host);
+    msg += ",";
     if (idf_wifi_is_ap_mode()) {
         // 配网热点内：原地 APSTA 连接、不重启，配网页轮询 /apstatus 显示 IP，
         // 连上后由设备延时自动关闭热点(见 idf_wifi_provision_connect)
         idf_wifi_provision_connect(ssid_s, pass_s);
-        std::string msg = "{\"success\":true,\"message\":\"已保存，正在连接\"}";
+        json_prop(msg, "message", "已保存，正在连接");
+        msg += "}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
-    std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
+    json_prop(msg, "message", "WiFi 已保存，设备即将重启");
+    msg += "}";
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
     schedule_restart_or_now("wifi_restart");
     return send_err;
 }
 
-// 配网专用极简状态：只回连接态与本机 STA IP，绝不包含任何已有配置
+// 配网状态仅包含连接态、STA IP 和公开的 mDNS 名称，不返回 WiFi 凭据等敏感配置。
 static esp_err_t handle_apstatus(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;  // AP 模式经白名单免密；STA 模式仍需登录
@@ -1710,7 +1724,11 @@ static esp_err_t handle_apstatus(httpd_req_t* req)
     body += (wifi.staConnected && !wifi.ip.empty()) ? "true" : "false";
     body += ",\"ip\":\"";
     body += wifi.ip;
-    body += "\"}";
+    body += "\",";
+    char mdns_host[33] = {};
+    idf_config_copy_mdns_host(mdns_host, sizeof(mdns_host));
+    json_prop(body, "mdnsHost", mdns_host);
+    body += "}";
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 

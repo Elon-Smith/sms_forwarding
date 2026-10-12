@@ -9,7 +9,7 @@ function app() {
     modemSampleResult: { textContent: '' },
     ovRefresh: { textContent: '' }
   };
-  const timers = [], urls = [];
+  const timers = [], urls = [], notices = [];
   let reply = () => Promise.resolve({ modemSampleRequested: 1, modemSampleCompleted: 0 });
   const context = {
     console, Date, Promise, URLSearchParams,
@@ -23,12 +23,13 @@ function app() {
   context.window = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../code/web_src/app.js'), 'utf8'), context);
-  return { context, elements, timers, urls, setReply(fn) { reply = fn; } };
+  context.showToast = (message, kind) => notices.push({message, kind});
+  return { context, elements, timers, urls, notices, setReply(fn) { reply = fn; } };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
 async function testQueuedAndComplete() {
-  const { context: c, elements: e, timers, urls } = app();
+  const { context: c, elements: e, timers, urls, notices } = app();
   c.refreshModemInfo(e.modemRefreshButton);
   await settle();
   assert.match(urls[0], /sample=1/);
@@ -44,6 +45,10 @@ async function testQueuedAndComplete() {
   assert.match(e.modemSampleResult.textContent, /运营商仍未读到/);
   c.renderModemSampleState({ modemSampleRequested: 2, modemSampleCompleted: 2, iccid: '8986001234567890123', operator: 'CMCC' });
   assert.equal(e.modemSampleResult.textContent, '模组信息刷新完成');
+  assert.equal(e.modemSampleResult.hidden, true);
+  const noticeCount = notices.length;
+  c.renderModemSampleState({modemSampleRequested: 2, modemSampleCompleted: 2, iccid: '8986001234567890123', operator: 'CMCC'});
+  assert.equal(notices.length, noticeCount, '被动轮询不能重复弹出旧完成提示');
 }
 async function testInflightPollAndErrors() {
   const a = app(), c = a.context, e = a.elements;

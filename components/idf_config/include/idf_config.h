@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.1.6";
+static constexpr const char* IDF_FW_VERSION = "1.1.7";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "https://gg.incrafttime.top/api/payload?size=64342";
@@ -122,7 +122,9 @@ using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
 
 esp_err_t idf_config_load(void);
 // 配网保存：同名更新密码并提到槽位 0，新网络插入槽位 0，满员挤掉最旧一组
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
+// 配网可同时保存 mDNS 名称；旧调用省略该参数时保留已有名称。
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
+                               const std::string* mdns_host = nullptr);
 // 网页整表保存历史 WiFi 列表；preserve_blank_pass=true 时已存网络密码留空表示不修改
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
                                         bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm);

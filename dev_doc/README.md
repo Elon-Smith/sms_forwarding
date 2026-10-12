@@ -1,5 +1,7 @@
 # 开发文档
 
+- [使用与开发指南](usage_guide.md)：功能说明、固件刷写、通道配置、保号与短信体检。
+
 - `architecture.md`：ESP-IDF 组件关系和主要数据流。
 - `module_details.md`：各组件职责。
 - `api_reference.md`：Web/API/AT 相关接口说明。

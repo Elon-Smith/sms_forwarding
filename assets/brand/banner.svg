@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="400" viewBox="0 0 1024 400" role="img" aria-label="SMS Forwarding brand graphic">
+    <defs>
+        <linearGradient id="bg" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#090B0D"/><stop offset="0.48" stop-color="#17191C"/><stop offset="1" stop-color="#090B0D"/></linearGradient>
+        <radialGradient id="glow"><stop offset="0" stop-color="#A5A6AA" stop-opacity=".17"/><stop offset="1" stop-color="#B6B8C0" stop-opacity="0"/></radialGradient>
+        <pattern id="texture" width="96" height="96" patternUnits="userSpaceOnUse"><path d="M0 0H96V96" fill="none" stroke="#FFFFFF" opacity=".023" stroke-width=".8"/><circle cx="96" cy="96" r="1" fill="white" opacity=".1"/></pattern>
+        <pattern id="messages" width="225" height="165" patternUnits="userSpaceOnUse"><path d="M28 41 H106 Q118 41 118 53 V93 Q118 106 105 106 H72 L59 119 V106 H28 Q16 106 16 93 V53 Q16 41 28 41Z" fill="none" stroke="#B2BAC3" stroke-width="1.2" opacity=".095"/><path d="M42 71 H84 M72 59 L85 71 L72 84" fill="none" stroke="#B2BAC3" stroke-width="2" opacity=".08"/></pattern>
+        </defs>
+    <rect width="1024" height="400" fill="url(#bg)"/><rect x="0" y="0" width="1024" height="400" fill="url(#texture)"/><rect x="0" y="0" width="1024" height="400" fill="url(#messages)"/><ellipse cx="240" cy="230" rx="480" ry="350" fill="url(#glow)"/><g transform="translate(44 171) scale(0.77)"><g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M73 42 H183 C204 42 219 57 219 80 V146 C219 169 203 184 180 184 H113 L72 216 V184 H73 C50 184 35 168 35 145 V81 C35 58 50 42 73 42Z" stroke-width="15.8"/>
+          <path d="M75 114 H165" stroke-width="19"/>
+          <path d="M138 85 L168 114 L138 143" stroke-width="19"/>
+          <path d="M76 145 H105" stroke-width="10" opacity="0.7"/>
+        </g></g>
+           <text x="248" y="259" fill="#FFFFFF" font-family="Inter Display, Inter, Arial, sans-serif" font-size="69" font-weight="850" letter-spacing="-3.7">SMS Forwarding</text>
+           <text x="251" y="309" fill="#CDCDD2" font-family="Inter,Arial" font-size="26" font-weight="450" letter-spacing="-.6">Reliable messages. Anywhere.</text>
+           <path d="M253 333 H396" stroke="#FFFFFF" opacity=".32" stroke-width="1"/>
+           <text x="251" y="357" fill="#9DA2A8" font-family="Inter,Arial" font-size="13.7" font-weight="600" letter-spacing="1.7">ESP32-C3   /   4G LTE   /   WEB UI</text>
+           <text x="40" y="43" fill="#A9ADB1" opacity=".72" font-family="Inter,Arial" font-size="12" letter-spacing="3">OPEN SOURCE  •  ESP-IDF</text>
+           <text x="980" y="43" fill="#A9ADB1" text-anchor="end" opacity=".45" font-family="Inter,Arial" font-size="12" letter-spacing="1.8">SMS GATEWAY</text>
+
+    </svg>

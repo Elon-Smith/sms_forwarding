@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const elements = {};
-function element() { return {style: {}, classList: {toggle() {}}, value: '', checked: false}; }
+function element() { return {style: {}, classList: {toggle() {}}, value: '', checked: false, appendChild() {}}; }
+elements.stForm = element();
 const document = {
   getElementById: id => elements[id] || null,
   querySelectorAll: () => [], querySelector: () => null, addEventListener() {},
@@ -45,4 +46,36 @@ for (let i = 0; i < 6; i++) {
   assert.equal(elements['st' + i + 'Reply'].checked, false);
   assert.equal(card.style.display, 'none');
 }
-console.log('scheduled SMS UI regressions passed (6 task slots)');
+assert.equal(elements.stForm.hidden, false, '删除最后一个任务后仍可保存空配置');
+context.stDirty = false;
+context.stShow(0, false);
+assert.equal(elements.stForm.hidden, true, '没有任务或待保存删除时隐藏空表单');
+// 首次加载完成前禁止添加；后续状态刷新只更新执行状态，保留未保存编辑。
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  const pending = [];
+  context.stBuilt = true;
+  context.currentPanel = 'keepalive';
+  elements.stAddBtn = element();
+  elements.stAddBtn.disabled = true;
+  elements.stForm.appendChild = child => {elements[child.id] = child;};
+  context.fetch = url => url.startsWith('/schedtask')
+    ? new Promise(resolve => pending.push(data => resolve({ok: true, json: async () => data})))
+    : Promise.resolve({ok: true, json: async () => ({profiles: []})});
+  context.stAddTask();
+  assert.equal(elements.stTask0.style.display, 'none');
+  context.stLoadStatus();
+  pending.shift()({tasks: [{enabled: true, name: '已保存任务', intervalDays: 30, action: '0', switchBack: true}], timeValid: true});
+  await settle();
+  assert.equal(elements.st0Name.value, '已保存任务');
+  assert.equal(elements.stAddBtn.disabled, false);
+  assert.ok(elements.stFormFlag);
+  elements.st0Name.value = '用户新名称';
+  elements.st0En.checked = false;
+  context.stLoadStatus();
+  pending.shift()({tasks: [{enabled: true, name: '服务端旧名称', intervalDays: 30, action: '0'}], timeValid: true});
+  await settle();
+  assert.equal(elements.st0Name.value, '用户新名称');
+  assert.equal(elements.st0En.checked, false);
+  console.log('scheduled SMS UI regressions passed (6 slots, loading guard and preserved edits)');
+})().catch(error => {console.error(error); process.exit(1);});
