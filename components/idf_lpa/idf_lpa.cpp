@@ -26,7 +26,7 @@
 #include "idf_util.h"
 #include "idf_modem.h"
 #include "mbedtls/base64.h"
-#include "psa/crypto.h"
+#include "mbedtls/sha256.h"
 
 namespace {
 
@@ -2391,10 +2391,7 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
 {
     if (!event || !event->user_data) return ESP_OK;
     auto* capture = static_cast<Es9BppCapture*>(event->user_data);
-    if (event->event_id == HTTP_EVENT_ON_STATUS_CODE && event->data &&
-        event->data_len >= static_cast<int>(sizeof(int))) {
-        capture->statusCode = *static_cast<const int*>(event->data);
-    } else if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key) {
+    if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key) {
         if (equal_ascii_ci(event->header_key, "X-Admin-Protocol")) {
             capture->adminProtocolSeen = true;
             capture->adminProtocol.assign(event->header_value ? event->header_value : "");
@@ -2403,6 +2400,8 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
         const size_t length = static_cast<size_t>(event->data_len);
         if (!capture->bodyPreflightChecked) {
             capture->bodyPreflightChecked = true;
+            // IDF 5.5.5 在头部完成时保存状态码，早于 ON_DATA 回调。
+            capture->statusCode = esp_http_client_get_status_code(event->client);
             if (capture->statusCode != 200) {
                 capture->scannerError = ESP_ERR_INVALID_RESPONSE;
                 *capture->scannerMessage = "ES9+ GetBPP HTTP 状态异常";
@@ -2624,18 +2623,12 @@ static bool compute_hash_cc(const std::string& confirmation_code,
         message = "Confirmation Code 或 transactionId 为空";
         return false;
     }
-    if (psa_crypto_init() != PSA_SUCCESS) {
-        message = "PSA Crypto 初始化失败";
-        return false;
-    }
     SensitiveBytes first;
-    first.value.resize(PSA_HASH_LENGTH(PSA_ALG_SHA_256));
-    size_t first_length = 0;
-    psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256,
-                                           reinterpret_cast<const uint8_t*>(confirmation_code.data()),
-                                           confirmation_code.size(), first.value.data(),
-                                           first.value.size(), &first_length);
-    if (status != PSA_SUCCESS || first_length != first.value.size()) {
+    first.value.resize(32);
+    int status = mbedtls_sha256(
+        reinterpret_cast<const uint8_t*>(confirmation_code.data()),
+        confirmation_code.size(), first.value.data(), 0);
+    if (status != 0) {
         message = "Confirmation Code 哈希失败";
         return false;
     }
@@ -2643,11 +2636,9 @@ static bool compute_hash_cc(const std::string& confirmation_code,
     input.value.reserve(first.value.size() + transaction_id.size());
     input.value.insert(input.value.end(), first.value.begin(), first.value.end());
     input.value.insert(input.value.end(), transaction_id.begin(), transaction_id.end());
-    hash_cc.resize(PSA_HASH_LENGTH(PSA_ALG_SHA_256));
-    size_t output_length = 0;
-    status = psa_hash_compute(PSA_ALG_SHA_256, input.value.data(), input.value.size(), hash_cc.data(),
-                              hash_cc.size(), &output_length);
-    if (status != PSA_SUCCESS || output_length != hash_cc.size()) {
+    hash_cc.resize(32);
+    status = mbedtls_sha256(input.value.data(), input.value.size(), hash_cc.data(), 0);
+    if (status != 0) {
         clear_sensitive_bytes(hash_cc);
         message = "Confirmation Code 哈希失败";
         return false;

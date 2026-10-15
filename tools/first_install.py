@@ -2,7 +2,7 @@
 """Explicit first-install tool: identify, read twice, verify backup, write and verify.
 
 Without --apply this only prints the plan and opens no serial port.
-Requires the ESP-IDF Python environment (esptool 5.x).
+Requires the ESP-IDF Python environment (esptool 4.12.x supplied by IDF 5.5.5).
 """
 import argparse, datetime, hashlib, json, re, subprocess, sys
 from pathlib import Path
@@ -10,7 +10,7 @@ from package_candidate import FLASH_SIZE, ROOT, image_identity, sha
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--package',type=Path,default=ROOT/'dist/1.1.7-dual.1-candidate')
+    p.add_argument('--package',type=Path,default=ROOT/'dist/1.1.7-dual.2-idf555-candidate')
     p.add_argument('--port',required=True)
     p.add_argument('--expected-mac',required=True)
     p.add_argument('--backup-dir',type=Path,required=True)
@@ -31,23 +31,23 @@ def main():
     dest=backup_root/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+a.expected_mac.replace(':',''))
     dest.mkdir(parents=True,exist_ok=False)
     def run(*args):
-        cmd=[sys.executable,'-m','esptool','--chip','esp32c3','--port',a.port,'--before','default-reset','--after','no-reset',*map(str,args)]
+        cmd=[sys.executable,'-m','esptool','--chip','esp32c3','--port',a.port,'--before','default_reset','--after','no_reset',*map(str,args)]
         result=subprocess.run(cmd,text=True,encoding='utf-8',errors='replace',capture_output=True)
         with (dest/'install.log').open('a',encoding='utf-8') as log:log.write(result.stdout+result.stderr+'\n')
         if result.returncode:raise RuntimeError('esptool failed; inspect '+str(dest/'install.log'))
         return result.stdout+result.stderr
-    identity=run('read-mac')
+    identity=run('read_mac')
     found=re.findall(r'MAC:\s*((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})',identity)
     if not found or found[-1].lower()!=a.expected_mac.lower():raise ValueError('Connected MAC differs; no Flash write performed')
-    flash=run('flash-id')
+    flash=run('flash_id')
     if not re.search(r'Detected flash size:\s*4MB',flash,re.I):raise ValueError('A 4 MiB Flash device is required')
     first,second=dest/'original-flash.bin',dest/'original-flash-second-read.bin'
-    run('read-flash','0',str(FLASH_SIZE),first)
-    run('read-flash','0',str(FLASH_SIZE),second)
+    run('read_flash','0',str(FLASH_SIZE),first)
+    run('read_flash','0',str(FLASH_SIZE),second)
     if first.stat().st_size!=FLASH_SIZE or sha(first.read_bytes())!=sha(second.read_bytes()):raise ValueError('Backup reads differ; no Flash write performed')
     (dest/'backup.json').write_text(json.dumps({'mac':a.expected_mac,'port':a.port,'bytes':FLASH_SIZE,'sha256':sha(first.read_bytes()),'package':manifest},indent=2)+'\n','utf-8')
-    run('write-flash','--flash-mode','dio','--flash-freq','80m','--flash-size','4MB','0',full)
-    run('verify-flash','0',full)
+    run('write_flash','--flash_mode','dio','--flash_freq','80m','--flash_size','4MB','0',full)
+    run('verify_flash','0',full)
     print('Flash verified. Backup: '+str(dest)+'. Power-cycle, provision afresh, then perform hardware acceptance. This is not a stability pass.')
 
 if __name__=='__main__':main()

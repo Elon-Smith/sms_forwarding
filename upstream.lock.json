@@ -2,9 +2,13 @@
   "repository": "https://github.com/MineSunshineone/sms_forwarding",
   "commit": "d4271d46f40bca215d2fba966b83051a1a4460be",
   "upstream_version": "1.1.7",
-  "esp_idf": "v6.0.2",
-  "firmware_version": "1.1.7-dual.1",
+  "esp_idf": "v5.5.5",
+  "firmware_version": "1.1.7-dual.2-idf555",
   "project_name": "sms_forwarding_dual",
   "hardware_status": "PENDING",
-  "automatic_upstream_updates": false
+  "automatic_upstream_updates": false,
+  "esp_idf_commit": "b774170ff46c393eeb5e495ea37936038d3f4f4f",
+  "mbedtls_version": "3.6.6",
+  "mbedtls_commit": "9d669eadb1955d348986b9280156710aaaadf79f",
+  "riscv_toolchain": "esp-14.2.0_20260121"
 }

@@ -42,6 +42,9 @@ class PatchTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.idf = Path(self.tmp.name)
         subprocess.run(["git", "init", "-q", str(self.idf)], check=True)
+        version = self.idf / "tools/cmake/version.cmake"
+        version.parent.mkdir(parents=True)
+        version.write_text("set(IDF_VERSION_MAJOR 5)\nset(IDF_VERSION_MINOR 5)\nset(IDF_VERSION_PATCH 5)\n", encoding="utf-8")
         self.sources = []
         for target, patch in patcher.PATCHES:
             target = self.idf / target
@@ -74,14 +77,14 @@ class PatchTests(unittest.TestCase):
         patcher.apply_patch(ROOT, self.idf, True)
         self.assertEqual(after, self.snapshot())
 
-    def test_mixed_applied_and_unapplied(self):
+    def test_already_applied_profile(self):
         target, patch = patcher.PATCHES[0]
         patcher.apply_one_patch(self.idf / target, ROOT / patch, False)
         patcher.apply_patch(ROOT, self.idf, False)
         for target, patch in patcher.PATCHES:
             self.assertTrue(patcher.git_apply_check(self.idf / target, ROOT / patch, reverse=True)[0])
 
-    def test_bad_second_patch_does_not_apply_first(self):
+    def test_incompatible_source_is_rejected_before_mutation(self):
         self.sources[-1].write_text("incompatible SDK\n", encoding="utf-8")
         before = self.snapshot()
         with self.assertRaisesRegex(RuntimeError, "拒绝 fuzzy/部分应用"):
@@ -91,9 +94,16 @@ class PatchTests(unittest.TestCase):
     def test_partially_applied_patch_is_rejected(self):
         path = self.sources[-1]
         source = path.read_text(encoding="utf-8")
-        path.write_text(source.replace("2018-2025 Espressif", "2018-2026 Espressif"), encoding="utf-8")
+        path.write_text(source.replace("int ret, parse_ret = 0;", "int ret;"), encoding="utf-8")
         before = self.snapshot()
         with self.assertRaisesRegex(RuntimeError, "拒绝 fuzzy/部分应用"):
+            patcher.apply_patch(ROOT, self.idf, False)
+        self.assertEqual(before, self.snapshot())
+
+    def test_wrong_sdk_is_rejected_before_mutation(self):
+        (self.idf / "tools/cmake/version.cmake").write_text("set(IDF_VERSION_MAJOR 6)\n", encoding="utf-8")
+        before = self.snapshot()
+        with self.assertRaisesRegex(RuntimeError, "requires exactly ESP-IDF 5.5.5"):
             patcher.apply_patch(ROOT, self.idf, False)
         self.assertEqual(before, self.snapshot())
 
@@ -106,7 +116,7 @@ class PatchTests(unittest.TestCase):
             patcher.apply_one_patch(self.idf, self.idf / "missing.patch", False)
 
     def test_actual_sdk_when_available(self):
-        # CI 镜像提供 v6.0.2 源码；检查真实 SDK，上述测试只使用合成上下文。
+        # CI 镜像提供 v5.5.5 源码；检查真实 SDK，上述测试只使用合成上下文。
         import os
         if not os.environ.get("IDF_PATH"):
             self.skipTest("未安装 ESP-IDF；真实源码应用由固件 CI 验证")

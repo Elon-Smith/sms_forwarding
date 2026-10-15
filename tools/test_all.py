@@ -4,7 +4,7 @@ import json, os, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def main():
-    output=ROOT/'build/regression';output.mkdir(parents=True,exist_ok=True)
+    output=Path(os.environ.get('TEST_OUTPUT',str(ROOT/'build/regression')));output.mkdir(parents=True,exist_ok=True)
     tests=[(n,[sys.executable,'-X','utf8',f'tools/test_{n}.py']) for n in (
         'dual_dispatch','dual_config','dual_owner','dual_sms','dual_push','ap_provisioning','cellular_http',
         'daily_heartbeat','modem_refresh','modem_uart','scheduled_sms_health','sms_timestamp','web_performance')]

@@ -5,7 +5,7 @@
 ## 基线和目录
 
 - 上游：<https://github.com/MineSunshineone/sms_forwarding/tree/d4271d46f40bca215d2fba966b83051a1a4460be>，1.1.7，提交固定为 `d4271d46f40bca215d2fba966b83051a1a4460be`。
-- SDK：ESP-IDF **6.0.2**，使用上游 `tools/apply_idf_patches.py` 与 `patches/`；不自动升级。应用版本 `1.1.7-dual.1`，项目标识 `sms_forwarding_dual`。
+- SDK：ESP-IDF **5.5.5**，使用适配后的 `tools/apply_idf_patches.py` 与 `patches/idf5.5.5/`；不自动升级。SDK 改动按 2026-10-15 最新指令覆盖原 6.0.2 计划。应用版本 `1.1.7-dual.2-idf555`，项目标识 `sms_forwarding_dual`。
 - 开发分支 `codex/upstream-dual-modem`。开发目录为原工程的同级目录 `SMS-Forwarder-C3-upstream-dual`；这是交付前的独立工作副本。
 - 保留 `main/`、`components/`、`code/web_src/`、上游 PDU/TLS/LPA 实现。没有迁入本地旧 Arduino/IDF 源码、凭据、适配层或配置。新增的 `idf_board` 集中板级约束，`idf_network` 串行化 TLS 资源。
 - 编译依赖由上游源码和固定 SDK 提供；没有要求安装旧工程 Arduino 库。主机测试需要 Python 3、Node.js、C++17 编译器（Linux g++/clang++，Windows 可用 Zig C++，通过 `CXX` 指定）。
@@ -52,24 +52,27 @@ Wi-Fi、Web 账号、时间、邮件、五通道共享。网络/APN/运营商/�
 
 ## 构建和回归
 
-Windows，在已安装独立 IDF 6.0.2 环境后：
+Windows，在已安装独立 IDF 5.5.5 环境后：
 
 ```powershell
 # 指向自己的安装路径；脚本不包含固定盘符。
-$env:IDF_PATH = '<ESP-IDF 6.0.2 目录>'
+$env:IDF_PATH = '<ESP-IDF 5.5.5 目录>'
 $env:IDF_TOOLS_PATH = '<IDF 工具目录>'
 ./tools/build.ps1
+# Windows 主机测试需另行配置 CC / CXX（见下文）；构建入口清理其继承值。
 python -X utf8 tools/test_all.py
 python -X utf8 tools/package_candidate.py
 ```
 
-若 Windows 主机编译器为 Zig，可设置 `$env:CXX = '<zig.exe 的路径> c++ -Dtimegm=_mkgmtime -Wno-nullability-completeness'`。含空格的编译器路径用引号包住。Linux 使用 `CXX=c++`，导出 IDF 环境后运行上游补丁脚本，再 `idf.py -B build/idf6 -D SDKCONFIG=build/sdkconfig.idf6 build`。网页只编辑 `code/web_src/`，执行 `python tools/build_web_assets.py` 更新资源；CI 检查生成文件一致性。
+若 Windows 主机编译器为 Zig，可设置 `$env:CXX = '<zig.exe 的路径> c++ -Dtimegm=_mkgmtime -Wno-nullability-completeness'`。C 测试同时设置 `$env:CC = '<zig.exe 的路径> cc'`。含空格的编译器路径用引号包住。Linux 使用 `CXX=c++`，导出 IDF 环境后运行上游补丁脚本，再 `idf.py --no-ccache -B build/idf5.5.5 -D SDKCONFIG=build/sdkconfig.idf5.5.5 build`。网页只编辑 `code/web_src/`，执行 `python tools/build_web_assets.py` 更新资源；CI 检查生成文件一致性。
 
-CI 固定 `espressif/idf:v6.0.2`，先主机回归再编译并上传候选 artifact。当前取消自动发布稳定 Release。构建日志、回归原始输出位于忽略跟踪的 `build/`；结果说明见 `dev_doc/upstream_dual_test_report.md`。
+CI 固定 `espressif/idf:v5.5.5`，先主机回归再编译并上传候选 artifact。当前取消自动发布稳定 Release。构建日志、回归原始输出位于忽略跟踪的 `build/`；本次结果见 `dev_doc/idf555_rebuild_report.md`；旧 6.0.2 记录保留于 `dev_doc/upstream_dual_test_report.md`，不代表本次构建。
+
+构建目录固定为 `build/idf5.5.5`，配置为 `build/sdkconfig.idf5.5.5`。不复用 `build/idf6` 或机器级 ccache。构建后自动核查 SDK 提交、全部子模块及活动补丁、GCC 14.2.0、IDF 5.5 Python、组件/编译路径；打包再次核查，并验证应用和 bootloader 的 ESP 校验和与附加 SHA-256、应用/ELF 对应关系。详情保存在 `environment-audit.json`。
 
 ## 首次安装与配网
 
-`dist/1.1.7-dual.1-candidate/` 包含：
+`dist/1.1.7-dual.2-idf555-candidate/` 包含：
 
 | 文件 | 用途 |
 | --- | --- |
@@ -77,6 +80,7 @@ CI 固定 `espressif/idf:v6.0.2`，先主机回归再编译并上传候选 artif
 | `ota.bin` | 后续网页 OTA，仅应用镜像，不能从地址 0 烧录 |
 | `bootloader.bin`、`partition-table.bin` | 对照和恢复辅助文件 |
 | `manifest.json`、`SHA256SUMS.txt` | 芯片、版本、SDK、ELF 身份、各文件大小及 SHA-256 |
+| `environment-audit.json` | SDK、工具链、编译路径和应用/bootloader 校验记录 |
 | `source-manifest.json` | 本地源码逐文件校验，用于关联确切源码 |
 
 目标硬件接入后先核对芯片、MAC、4 MiB Flash、两块 ATI 和接线电平/供电。工具默认预演，不打开串口：

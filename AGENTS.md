@@ -1,6 +1,6 @@
 # 当前双模组开发约定
 
-本分支仅基于上游 d4271d46f40bca215d2fba966b83051a1a4460be / ESP-IDF 6.0.2。不得迁入旧本地工程源码或配置。保留上游组件位置，双卡接口显式携带 IdfModemId (1/2)，禁止全局当前卡。引脚集中在 idf_board。旧工程必须在实机验收通过后才能清理；设备计费短信由用户手动执行。下方上游说明与双卡实现冲突时以上述约定和 dev_doc/upstream_dual_modem.md 为准。
+本分支仅基于上游 d4271d46f40bca215d2fba966b83051a1a4460be / ESP-IDF 5.5.5。不得迁入旧本地工程源码或配置。保留上游组件位置，双卡接口显式携带 IdfModemId (1/2)，禁止全局当前卡。引脚集中在 idf_board。旧工程必须在实机验收通过后才能清理；设备计费短信由用户手动执行。下方上游说明与双卡实现冲突时以上述约定和 dev_doc/upstream_dual_modem.md 为准。
 
 # AGENTS.md
 
@@ -22,14 +22,14 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-The helper loads ESP-IDF 6.0.2, applies the repository-managed Mbed TLS compatibility patch at `patches/mbedtls/`, uses Ninja parallelism, and writes generated files to `build/idf6` with configuration at `build/sdkconfig.idf6`.
+The helper loads ESP-IDF 5.5.5, applies the repository-managed Mbed TLS compatibility patch at `patches/idf5.5.5/`, uses Ninja parallelism, and writes generated files to `build/idf5.5.5` with configuration at `build/sdkconfig.idf5.5.5`.
 
-Required ESP-IDF: **v6.0.2**. The firmware targets Mbed TLS 4 / PSA Crypto and does not maintain ESP-IDF 5.x compatibility. CI uses the fixed `espressif/idf:v6.0.2` image and applies the same patch after checking that its source context applies cleanly.
+Required ESP-IDF: **v5.5.5**. The firmware targets this SDK's native Mbed TLS 3.6.6. Do not use IDF 6.x headers, binaries, patches or build caches. CI uses the fixed `espressif/idf:v5.5.5` image and applies the same patch after checking that its source context applies cleanly.
 
 For direct Linux `idf.py` use, load the fixed SDK and apply the repository patch first:
 
 ```bash
-. /home/alex/code/sdk/esp-idf/6.0/export.sh
+. "$IDF_PATH/export.sh"
 python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
 ```
 

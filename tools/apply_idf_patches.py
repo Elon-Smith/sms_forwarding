@@ -13,12 +13,20 @@ import sys
 # 每个 patch 的目标目录相对于 ESP-IDF 根目录；Mbed TLS 是独立子模块。
 PATCHES = (
     (Path("components/mbedtls/mbedtls"), Path(
-        "patches/mbedtls/0001-x509-parse-all-certificate-policy-oids.patch"
-    )),
-    (Path("."), Path(
-        "patches/esp-idf/0001-crt-bundle-cross-signed-memory-leak.patch"
+        "patches/idf5.5.5/0001-x509-parse-all-certificate-policy-oids.patch"
     )),
 )
+
+
+def check_sdk_version(idf_path: Path) -> None:
+    import re
+    path = idf_path / "tools/cmake/version.cmake"
+    source = path.read_text(encoding="utf-8") if path.is_file() else ""
+    parts = [re.search(r"set\(IDF_VERSION_" + name + r"\s+(\d+)\)", source)
+             for name in ("MAJOR", "MINOR", "PATCH")]
+    if not all(parts) or tuple(int(p.group(1)) for p in parts) != (5, 5, 5):
+        raise RuntimeError("SDK patch requires exactly ESP-IDF 5.5.5; refusing mixed SDK")
+
 
 
 def git_apply_check(repo: Path, patch: Path, reverse: bool = False) -> tuple[bool, str]:
@@ -95,6 +103,7 @@ def apply_one_patch(target: Path, patch_path: Path, check_only: bool) -> None:
 def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
     if not idf_path.is_dir():
         raise RuntimeError(f"ESP-IDF 路径不存在: {idf_path}")
+    check_sdk_version(idf_path)
     # 先检查全部 patch，避免上下文不匹配时留下部分打补丁的 SDK。
     for target, patch in PATCHES:
         apply_one_patch(idf_path / target, repo_root / patch, True)

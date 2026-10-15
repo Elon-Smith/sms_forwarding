@@ -1,4 +1,4 @@
-> **本分支：ESP32-C3 双 ML307C 候选版，尚未通过实机验收。** 固定上游 1.1.7 / ESP-IDF 6.0.2。请先阅读 [双卡接线、构建与安装指南](dev_doc/upstream_dual_modem.md) 和 [验证记录](dev_doc/upstream_dual_test_report.md)。下方保留上游说明；单模组固件与原烧录说明不适用于本分支首次安装。
+> **本分支：ESP32-C3 双 ML307C 候选版，尚未通过实机验收。** 固定上游 1.1.7 / ESP-IDF 5.5.5。请先阅读 [双卡接线、构建与安装指南](dev_doc/upstream_dual_modem.md) 和 [5.5.5 构建验证记录](dev_doc/idf555_rebuild_report.md)。下方保留上游说明；单模组固件与原烧录说明不适用于本分支首次安装。
 
 ![SMS Forwarding — Reliable messages. Anywhere.](assets/brand/banner.svg)
 
@@ -68,7 +68,7 @@
 
 ## 开发与构建
 
-仅支持原生 **ESP-IDF 6.0.2**，目标芯片 ESP32-C3，默认 Flash 为 4 MB。Windows 脚本默认读取 `E:\Espressif\esp-idf-v6.0.2`，也可通过 `IDF_PATH` / `IDF_TOOLS_PATH` 指定 SDK 位置。
+仅支持原生 **ESP-IDF 5.5.5**，目标芯片 ESP32-C3，默认 Flash 为 4 MB。Windows 脚本通过 `IDF_PATH` / `IDF_TOOLS_PATH` 指定独立 SDK 和工具目录，不依赖固定盘符。
 
 ```powershell
 # 修改 Web UI 后先重新生成静态资源
@@ -81,7 +81,7 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-构建产物位于 `build/idf6`；CI 使用固定的 ESP-IDF 6.0.2 镜像。可编辑的前端源文件在 `code/web_src/`，`code/web_assets.*` 为生成文件。
+构建产物位于 `build/idf5.5.5`；CI 使用固定的 ESP-IDF 5.5.5 镜像。可编辑的前端源文件在 `code/web_src/`，`code/web_assets.*` 为生成文件。
 
 ## 文档
 
