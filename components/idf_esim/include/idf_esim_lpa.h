@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <array>
 #include <stddef.h>
@@ -38,7 +39,7 @@ esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
 // 重新打开最短的 eUICC 会话，避免 HTTPS 等待期间长期占用 AT 通道。
 class IdfEsimLpaBppSession {
 public:
-    IdfEsimLpaBppSession();
+    explicit IdfEsimLpaBppSession(IdfModemId sim = IDF_SIM1);
     IdfEsimLpaBppSession(const IdfEsimLpaBppSession&) = delete;
     IdfEsimLpaBppSession& operator=(const IdfEsimLpaBppSession&) = delete;
     ~IdfEsimLpaBppSession();
@@ -53,5 +54,23 @@ public:
     void close();
 
 private:
+    IdfModemId sim_;
     void* impl_;
 };
+
+esp_err_t idf_esim_lpa_remove_notification(IdfModemId sim, uint32_t sequence_number,
+                                            std::string& safe_message);
+esp_err_t idf_esim_lpa_retrieve_notifications(IdfModemId sim,
+    std::vector<uint8_t>& encoded_response,
+    size_t& list_offset,
+    size_t& list_length,
+    std::string& safe_message);
+esp_err_t idf_esim_lpa_prepare_download(IdfModemId sim, const std::vector<uint8_t>& request,
+                                        std::vector<uint8_t>& response,
+                                        std::string& safe_message);
+esp_err_t idf_esim_lpa_authenticate_server(IdfModemId sim, const std::vector<uint8_t>& request,
+                                           std::vector<uint8_t>& response,
+                                           std::string& safe_message);
+esp_err_t idf_esim_lpa_get_auth_material(IdfModemId sim, std::vector<uint8_t>& euicc_info1,
+                                         std::array<uint8_t, 16>& challenge,
+                                         std::string& safe_message);

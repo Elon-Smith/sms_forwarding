@@ -1,4 +1,6 @@
 #pragma once
+#include <functional>
+#include "idf_board.h"
 
 #include <stdint.h>
 
@@ -8,6 +10,10 @@
 #include "idf_config.h"
 
 struct IdfModemStatus {
+    uint32_t generation = 1;
+    int callCapability = 0; // 0=待确认，1=支持，-1=不支持
+    uint32_t uartErrors = 0;
+    uint32_t stackFree = 0;
     bool started = false;
     bool atReady = false;
     bool modemReady = false;
@@ -56,7 +62,7 @@ struct IdfCellularHttpConfig {
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, void (*on_submit)() = nullptr);
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, std::function<void()> on_submit = nullptr);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
                                            const char* content_type, const std::string& body,
@@ -99,3 +105,33 @@ void idf_modem_set_sim_identity_hook(void (*hook)(void));
 // 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
 // 热启动快路径只服务于崩溃/看门狗等意外复位
 void idf_modem_power_off_for_restart(void);
+
+// 显式双模组接口；旧入口固定为 SIM1。
+esp_err_t idf_modem_send_at(IdfModemId sim, const std::string& cmd, uint32_t timeout_ms, std::string& response, uint32_t expected_generation = 0);
+esp_err_t idf_modem_send_at_until(IdfModemId sim, const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_send_pdu(IdfModemId sim, const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, std::function<void()> on_submit, uint32_t expected_generation = 0);
+esp_err_t idf_modem_get_operator(IdfModemId sim, std::string& name);
+esp_err_t idf_modem_cellular_http_get(IdfModemId sim, const std::string& url, const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result);
+esp_err_t idf_modem_cellular_http_request(IdfModemId sim, const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result);
+void idf_modem_reassert_sms_storage(IdfModemId sim);
+bool idf_modem_sms_health_check(IdfModemId sim, std::string& summary);
+esp_err_t idf_modem_start(IdfModemId sim, const IdfConfig& config);
+IdfModemStatus idf_modem_get_status(IdfModemId sim);
+esp_err_t idf_modem_get_imei(IdfModemId sim, std::string& imei);
+esp_err_t idf_modem_request_reset(IdfModemId sim, bool hard_reset);
+esp_err_t idf_modem_request_sim_unlock(IdfModemId sim, bool allow_puk);
+bool idf_modem_at_idle(IdfModemId sim);
+void idf_modem_request_status_sample(IdfModemId sim);
+void idf_modem_begin_esim_operation(IdfModemId sim);
+void idf_modem_end_esim_operation(IdfModemId sim);
+bool idf_modem_esim_operation_active(IdfModemId sim);
+void idf_modem_set_sim_identity_hook(IdfModemId sim, void (*hook)(void));
+void idf_modem_invalidate_sim_identity(IdfModemId sim);
+void idf_modem_power_off_for_restart(IdfModemId sim);
+bool idf_modem_wait_event(IdfModemId sim, uint32_t timeout_ms);
+void idf_modem_signal_event(IdfModemId sim);
+bool idf_modem_take_urc(IdfModemId sim, std::string& out);

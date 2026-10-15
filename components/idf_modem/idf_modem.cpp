@@ -27,12 +27,60 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
-static const char* TAG = "idf_modem";
+#include <functional>
+#include "freertos/queue.h"
 
-static constexpr uart_port_t MODEM_UART = UART_NUM_1;
-static constexpr gpio_num_t MODEM_TXD = GPIO_NUM_3;
-static constexpr gpio_num_t MODEM_RXD = GPIO_NUM_4;
-static constexpr gpio_num_t MODEM_EN = GPIO_NUM_5;
+class ModemInstance {
+public:
+    explicit ModemInstance(IdfModemId sim) : sim_(sim),
+        MODEM_UART(static_cast<uart_port_t>(IDF_MODEM_PINS[sim-1].uart)),
+        MODEM_TXD(static_cast<gpio_num_t>(IDF_MODEM_PINS[sim-1].tx)),
+        MODEM_RXD(static_cast<gpio_num_t>(IDF_MODEM_PINS[sim-1].rx)),
+        MODEM_EN(static_cast<gpio_num_t>(IDF_MODEM_PINS[sim-1].en)) {}
+    const IdfModemId sim_;
+    TaskHandle_t owner_ = nullptr;
+    QueueHandle_t commands_ = nullptr;
+    SemaphoreHandle_t session_mutex_ = nullptr;
+    std::atomic<TaskHandle_t> session_owner_{nullptr};
+    std::atomic<uint32_t> transaction_epoch_{1};
+    struct Command { std::function<esp_err_t()> work; SemaphoreHandle_t done; esp_err_t result; uint32_t generation; uint32_t epoch; TaskHandle_t caller; };
+    esp_err_t invoke(std::function<esp_err_t()> work, uint32_t expected_generation = 0) {
+        if (xTaskGetCurrentTaskHandle() == owner_) return work();
+        if (!commands_ || !idf_modem_get_status().atReady) return ESP_ERR_INVALID_STATE;
+        TaskHandle_t session = session_owner_.load();
+        if (session && session != xTaskGetCurrentTaskHandle()) return ESP_ERR_INVALID_STATE;
+        SemaphoreHandle_t done = xSemaphoreCreateBinary();
+        if (!done) return ESP_ERR_NO_MEM;
+        Command cmd{std::move(work), done, ESP_FAIL, expected_generation ? expected_generation : idf_modem_get_status().generation, transaction_epoch_.load(), xTaskGetCurrentTaskHandle()};
+        Command* ptr = &cmd;
+        if (xQueueSend(commands_, &ptr, 0) != pdTRUE) { vSemaphoreDelete(done); return ESP_ERR_TIMEOUT; }
+        // 请求和引用由调用者持有，必须等 owner 完成后才释放；事务内部有确定超时。
+        xSemaphoreTake(done, portMAX_DELAY);
+        vSemaphoreDelete(done);
+        return cmd.result;
+    }
+    void service_commands() {
+        Command* cmd = nullptr;
+        if (!commands_ || xQueueReceive(commands_, &cmd, 0) != pdTRUE) return;
+        if (s_reset_request.load() || cmd->epoch != transaction_epoch_.load() ||
+            (session_owner_.load() && session_owner_.load() != cmd->caller) ||
+            cmd->generation != idf_modem_get_status().generation)
+            cmd->result = ESP_ERR_INVALID_STATE;
+        else cmd->result = cmd->work();
+        if (cmd->result == ESP_ERR_TIMEOUT) { transaction_epoch_.fetch_add(1); s_reset_request.store(2); }
+        xSemaphoreGive(cmd->done);
+    }
+    void idf_log_line(const char* line) { ::idf_logf("[SIM%u] %s", sim_, line); }
+    template<class... Args> void idf_logf(const char* fmt, Args... args) {
+        std::string scoped = "[SIM" + std::to_string(sim_) + "] " + fmt;
+        ::idf_logf(scoped.c_str(), args...);
+    }
+static constexpr const char* TAG = "idf_modem";
+
+uart_port_t MODEM_UART;
+gpio_num_t MODEM_TXD;
+gpio_num_t MODEM_RXD;
+gpio_num_t MODEM_EN;
 static constexpr int MODEM_BAUD = 115200;
 static constexpr int UART_RX_BUF = 4096;
 static constexpr int MODEM_POWERDOWN_MS = 1200;
@@ -56,8 +104,6 @@ static constexpr uint32_t modem_retry_delay_ms(uint8_t level)
     size_t index = level < MODEM_RETRY_DELAY_COUNT ? level : MODEM_RETRY_DELAY_COUNT - 1;
     return MODEM_RETRY_DELAYS_MS[index];
 }
-static_assert(modem_retry_delay_ms(0) == 30000UL, "首次补采应在 30 秒后执行");
-static_assert(modem_retry_delay_ms(99) == 600000UL, "补采退避上限应为 10 分钟");
 // 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
@@ -66,39 +112,42 @@ static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检�
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 
-static SemaphoreHandle_t s_at_mutex = nullptr;
-static SemaphoreHandle_t s_status_mutex = nullptr;
-static SemaphoreHandle_t s_urc_mutex = nullptr;
+SemaphoreHandle_t s_at_mutex = nullptr;
+SemaphoreHandle_t s_status_mutex = nullptr;
+SemaphoreHandle_t s_urc_mutex = nullptr;
 // UART 驱动事件队列：URC 一到就唤醒模组任务抓取，替代固定 500ms 轮询延时
-static QueueHandle_t s_uart_evt_queue = nullptr;
+QueueHandle_t s_uart_evt_queue = nullptr;
 // 模组事件信号：新 URC 入缓冲/网页短信入队时唤醒短信任务，消除轮询等待
-static SemaphoreHandle_t s_event_sem = nullptr;
-static IdfModemStatus s_status;
-static std::string s_urc_buffer;
+SemaphoreHandle_t s_event_sem = nullptr;
+IdfModemStatus s_status;
+std::string s_urc_buffer;
 // 普通 AT 响应与异步 URC 共用 UART。按行持续提取短信/来电 URC，避免 +CMT 头和
 // 后续 PDU 落在两个读取周期时，PDU 被误吞进下一条 AT 响应。
-static std::string s_uart_line_carry;
-static int64_t s_uart_line_started_us = 0;
-static bool s_uart_wait_cmt_pdu = false;
-static int64_t s_uart_wait_cmt_until_us = 0;
-static bool s_started = false;
-static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
-static bool s_data_mode_retry_pending = false;
-static uint8_t s_data_mode_retry_count = 0;
-static TickType_t s_next_data_mode_retry = 0;
-static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
-static bool s_identity_static_attempted = false;
-static bool s_identity_network_attempted = false;
-static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
-static IdfModemSampling s_status_sampling;
-static std::atomic<uint32_t> s_esim_operation_depth{0};
-static std::atomic<int> s_sim_unlock_request{0};  // 1=重查/自动 PIN，2=用户确认后的单次 PUK
-static std::string s_last_pin_attempt_key;
+std::string s_uart_line_carry;
+uint32_t s_uart_generation = 0;
+int64_t s_uart_line_started_us = 0;
+bool s_uart_wait_cmt_pdu = false;
+int64_t s_uart_wait_cmt_until_us = 0;
+bool s_started = false;
+std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
+bool s_data_mode_retry_pending = false;
+uint8_t s_data_mode_retry_count = 0;
+TickType_t s_next_data_mode_retry = 0;
+std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
+bool s_identity_static_attempted = false;
+bool s_identity_network_attempted = false;
+std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
+IdfModemSampling s_status_sampling;
+std::atomic<uint32_t> s_esim_operation_depth{0};
+std::atomic<int> s_sim_unlock_request{0};  // 1=重查/自动 PIN，2=用户确认后的单次 PUK
+std::string s_last_pin_attempt_key;
 
-void idf_modem_signal_event(void);
 
-static void cleanup_start_resources()
+
+void cleanup_start_resources()
 {
+    if (commands_) { vQueueDelete(commands_); commands_ = nullptr; }
+    if (session_mutex_) { vSemaphoreDelete(session_mutex_); session_mutex_ = nullptr; }
     if (s_at_mutex) {
         vSemaphoreDelete(s_at_mutex);
         s_at_mutex = nullptr;
@@ -121,7 +170,7 @@ static void cleanup_start_resources()
     s_uart_wait_cmt_until_us = 0;
 }
 
-static bool parse_long_token(const std::string& value, long& out)
+bool parse_long_token(const std::string& value, long& out)
 {
     std::string text = idf_util_trim_copy(value);
     if (text.empty()) return false;
@@ -135,7 +184,7 @@ static bool parse_long_token(const std::string& value, long& out)
     return true;
 }
 
-static bool parse_comma_longs(const std::string& text, long* values, int max_values, int& count)
+bool parse_comma_longs(const std::string& text, long* values, int max_values, int& count)
 {
     count = 0;
     size_t start = 0;
@@ -164,7 +213,7 @@ struct TickDeadline {
 
 // AT 最终结果码：1=OK，-1=ERROR/+CMS ERROR/+CME ERROR(27.005/27.007 定义的失败终结码)，0=未结束。
 // 不要求末尾必须再跟 CRLF：部分长命令的最后一个 UART 块可能恰好止于 "OK"。
-static int at_final_result(const std::string& resp)
+int at_final_result(const std::string& resp)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
@@ -180,7 +229,7 @@ static int at_final_result(const std::string& resp)
     return 0;
 }
 
-static bool has_cmgs_result(const std::string& resp)
+bool has_cmgs_result(const std::string& resp)
 {
     size_t pos = resp.find("+CMGS:");
     if (pos == std::string::npos) return false;
@@ -192,7 +241,7 @@ static bool has_cmgs_result(const std::string& resp)
 }
 
 // 取包含 token 的那一整行(不同 URC 混在同一段响应里时不能只取"第一有效行")
-static std::string line_containing(const std::string& resp, size_t pos)
+std::string line_containing(const std::string& resp, size_t pos)
 {
     size_t start = resp.rfind('\n', pos);
     start = (start == std::string::npos) ? 0 : start + 1;
@@ -206,14 +255,14 @@ static std::string line_containing(const std::string& resp, size_t pos)
     return line.substr(s, e - s);
 }
 
-static bool line_is_payload(const std::string& line, const char* cmd)
+bool line_is_payload(const std::string& line, const char* cmd)
 {
     if (line.empty() || line == "OK" || line == "ERROR") return false;
     if (cmd && line == cmd) return false;
     return true;
 }
 
-static std::string first_payload_line(const std::string& resp, const char* cmd = nullptr)
+std::string first_payload_line(const std::string& resp, const char* cmd = nullptr)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
@@ -226,7 +275,7 @@ static std::string first_payload_line(const std::string& resp, const char* cmd =
     return {};
 }
 
-static std::string first_digits_line(const std::string& resp, size_t min_len, size_t max_len)
+std::string first_digits_line(const std::string& resp, size_t min_len, size_t max_len)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
@@ -241,7 +290,7 @@ static std::string first_digits_line(const std::string& resp, size_t min_len, si
     return {};
 }
 
-static std::string first_digit_run(const std::string& resp, size_t min_len, size_t max_len)
+std::string first_digit_run(const std::string& resp, size_t min_len, size_t max_len)
 {
     size_t start = std::string::npos;
     for (size_t i = 0; i <= resp.size(); ++i) {
@@ -257,12 +306,12 @@ static std::string first_digit_run(const std::string& resp, size_t min_len, size
     return {};
 }
 
-static bool is_iccid_text(const std::string& value)
+bool is_iccid_text(const std::string& value)
 {
     return !idf_normalize_iccid(value).empty();
 }
 
-static bool is_imei_text(const std::string& value)
+bool is_imei_text(const std::string& value)
 {
     if (value.size() < 14 || value.size() > 17) return false;
     for (char ch : value) {
@@ -271,7 +320,7 @@ static bool is_imei_text(const std::string& value)
     return true;
 }
 
-static std::string parse_imei_response(const std::string& resp)
+std::string parse_imei_response(const std::string& resp)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
@@ -293,7 +342,7 @@ static std::string parse_imei_response(const std::string& resp)
     return {};
 }
 
-static bool is_imsi_text(const std::string& value)
+bool is_imsi_text(const std::string& value)
 {
     if (value.size() < 14 || value.size() > 16) return false;
     for (char ch : value) {
@@ -302,7 +351,7 @@ static bool is_imsi_text(const std::string& value)
     return true;
 }
 
-static std::string first_quoted(const std::string& line, size_t start = 0)
+std::string first_quoted(const std::string& line, size_t start = 0)
 {
     size_t q1 = line.find('"', start);
     if (q1 == std::string::npos) return {};
@@ -311,7 +360,7 @@ static std::string first_quoted(const std::string& line, size_t start = 0)
     return line.substr(q1 + 1, q2 - q1 - 1);
 }
 
-static void set_phase(const char* phase)
+void set_phase(const char* phase)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         s_status.phase = phase;
@@ -330,7 +379,7 @@ static void set_phase(const char* phase)
     }
 }
 
-static void update_status(const IdfModemStatus& patch, bool identity = false, bool signal = false)
+void update_status(const IdfModemStatus& patch, bool identity = false, bool signal = false)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     s_status.started = patch.started || s_status.started;
@@ -363,7 +412,11 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     if (!patch.model.empty()) s_status.model = patch.model;
     if (!patch.fwver.empty()) s_status.fwver = patch.fwver;
     if (!patch.imei.empty() && is_imei_text(patch.imei)) s_status.imei = patch.imei;
-    if (!patch.iccid.empty() && is_iccid_text(patch.iccid)) s_status.iccid = idf_normalize_iccid(patch.iccid);
+    if (!patch.iccid.empty() && is_iccid_text(patch.iccid)) {
+        auto next = idf_normalize_iccid(patch.iccid);
+        if (!s_status.iccid.empty() && s_status.iccid != next) ++s_status.generation;
+        s_status.iccid = next;
+    }
     if (!patch.imsi.empty() && is_imsi_text(patch.imsi)) s_status.imsi = patch.imsi;
     if (!patch.operatorName.empty()) s_status.operatorName = patch.operatorName;
     if (!patch.apnSim.empty()) s_status.apnSim = patch.apnSim;
@@ -379,7 +432,7 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     xSemaphoreGive(s_status_mutex);
 }
 
-static bool startup_info_complete(void)
+bool startup_info_complete(void)
 {
     bool complete = false;
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -400,26 +453,26 @@ static bool startup_info_complete(void)
 
 // ICCID/运营商等字段可能被 SIM 或网络长期拒绝返回；完成一轮采样后即可进入 ready，
 // 缺失字段仍由 startup_info_complete() 驱动后台补采，不能让概览永远停在“读取中”。
-static bool startup_sampling_done(void)
+bool startup_sampling_done(void)
 {
     IdfModemStatus status = idf_modem_get_status();
     return status.signalFresh && status.identityFresh;
 }
 
-static void reset_identity_sampling_state(void)
+void reset_identity_sampling_state(void)
 {
     s_identity_static_attempted = false;
     s_identity_network_attempted = false;
 }
 
-static void set_status_cell_ip(const std::string& ip)
+void set_status_cell_ip(const std::string& ip)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     s_status.cellIp = ip;
     xSemaphoreGive(s_status_mutex);
 }
 
-static std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max_len)
+std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max_len)
 {
     size_t len = 0;
     esp_err_t err = nvs_get_str(nvs, key, nullptr, &len);
@@ -431,7 +484,7 @@ static std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max
     return value;
 }
 
-static void save_identity_cache(const std::string& imei, const std::string& iccid)
+void save_identity_cache(const std::string& imei, const std::string& iccid)
 {
     bool valid_imei = is_imei_text(imei);
     const std::string canonical_iccid = idf_normalize_iccid(iccid);
@@ -439,16 +492,16 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
     if (!valid_imei && !valid_iccid) return;
     nvs_handle_t nvs = 0;
     if (nvs_open("sms_config", NVS_READWRITE, &nvs) != ESP_OK) return;
-    std::string old_imei = read_nvs_string(nvs, "modemImei", 32);
-    std::string old_iccid = read_nvs_string(nvs, "modemIccid", 32);
+    std::string old_imei = read_nvs_string(nvs, (sim_ == 1 ? "modemImei" : "modem2Imei"), 32);
+    std::string old_iccid = read_nvs_string(nvs, (sim_ == 1 ? "modemIccid" : "modem2Iccid"), 32);
     esp_err_t err = ESP_OK;
     bool changed = false;
     if (valid_imei && imei != old_imei) {
-        err = nvs_set_str(nvs, "modemImei", imei.c_str());
+        err = nvs_set_str(nvs, (sim_ == 1 ? "modemImei" : "modem2Imei"), imei.c_str());
         changed = err == ESP_OK;
     }
     if (err == ESP_OK && valid_iccid && canonical_iccid != old_iccid) {
-        err = nvs_set_str(nvs, "modemIccid", canonical_iccid.c_str());
+        err = nvs_set_str(nvs, (sim_ == 1 ? "modemIccid" : "modem2Iccid"), canonical_iccid.c_str());
         changed = changed || err == ESP_OK;
     }
     if (err == ESP_OK && changed) err = nvs_commit(nvs);
@@ -456,11 +509,11 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
     if (err == ESP_OK && changed) idf_log_line("模组身份信息已写入缓存");
 }
 
-static void append_urc_text(const std::string& raw, int64_t received_us = 0)
+void append_urc_text(const std::string& raw, int64_t received_us = 0)
 {
     // 内部元数据随 URC 一起排队，避免旧短信稍后处理时被误认为探测发送后的新回复。
-    char stamp[48];
-    snprintf(stamp, sizeof(stamp), "@RXUS:%lld\n", static_cast<long long>(received_us ? received_us : esp_timer_get_time()));
+    char stamp[80];
+    snprintf(stamp, sizeof(stamp), "@CARDGEN:%lu\n@RXUS:%lld\n", static_cast<unsigned long>(idf_modem_get_status().generation), static_cast<long long>(received_us ? received_us : esp_timer_get_time()));
     std::string text = std::string(stamp) + raw;
     if (raw.empty() || !s_urc_mutex) return;
     if (xSemaphoreTake(s_urc_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
@@ -484,15 +537,15 @@ static void append_urc_text(const std::string& raw, int64_t received_us = 0)
     idf_modem_signal_event();  // 立即唤醒短信任务处理，不等它的轮询周期
 }
 
-static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap);
 
-static bool looks_like_pdu_line(const std::string& line)
+
+bool looks_like_pdu_line(const std::string& line)
 {
     if (line.size() < 32 || (line.size() & 1) != 0) return false;
     return std::all_of(line.begin(), line.end(), [](unsigned char ch) { return isxdigit(ch); });
 }
 
-static void preserve_uart_urc_line(const std::string& raw, int64_t received_us)
+void preserve_uart_urc_line(const std::string& raw, int64_t received_us)
 {
     std::string line = idf_util_trim_copy(raw);
     if (line.empty()) return;
@@ -513,8 +566,14 @@ static void preserve_uart_urc_line(const std::string& raw, int64_t received_us)
     }
 }
 
-static void preserve_uart_urcs(const uint8_t* data, size_t len)
+void preserve_uart_urcs(const uint8_t* data, size_t len)
 {
+    const uint32_t generation = idf_modem_get_status().generation;
+    if (generation != s_uart_generation) {
+        s_uart_generation = generation;
+        s_uart_line_carry.clear();
+        s_uart_wait_cmt_pdu = false;
+    }
     for (size_t i = 0; i < len; ++i) {
         char ch = static_cast<char>(data[i]);
         if (ch == '\r' || ch == '\n') {
@@ -530,7 +589,7 @@ static void preserve_uart_urcs(const uint8_t* data, size_t len)
     }
 }
 
-static void capture_pending_uart_locked(uint32_t max_ms)
+void capture_pending_uart_locked(uint32_t max_ms)
 {
     // RX 缓冲为空时立即返回：该函数在每条 AT 命令前都会执行，
     // 空转等待 20ms×2 会拖慢所有 AT 操作(健康探测/补收批量删除/身份采样)
@@ -553,7 +612,7 @@ static void capture_pending_uart_locked(uint32_t max_ms)
 }
 
 // 返回是否成功抢到 AT 通道锁并完成抓取；false=通道正被长任务占用
-static bool poll_unsolicited_uart(uint32_t max_ms)
+bool poll_unsolicited_uart(uint32_t max_ms)
 {
     if (!s_at_mutex) return false;
     if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
@@ -562,9 +621,10 @@ static bool poll_unsolicited_uart(uint32_t max_ms)
     return true;
 }
 
-static void handle_uart_event_error(const uart_event_t& evt)
+void handle_uart_event_error(const uart_event_t& evt)
 {
     if (evt.type == UART_FIFO_OVF || evt.type == UART_BUFFER_FULL) {
+        if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) { ++s_status.uartErrors; xSemaphoreGive(s_status_mutex); }
         idf_log_line(evt.type == UART_FIFO_OVF
                          ? "模组 UART 硬件 FIFO 溢出，本次接收数据可能不完整"
                          : "模组 UART 接收缓冲已满，本次接收数据可能不完整");
@@ -575,7 +635,7 @@ static void handle_uart_event_error(const uart_event_t& evt)
     }
 }
 
-static bool at_channel_idle_now(void)
+bool at_channel_idle_now(void)
 {
     if (idf_modem_esim_operation_active()) return false;
     if (!s_at_mutex) return false;
@@ -584,7 +644,7 @@ static bool at_channel_idle_now(void)
     return true;
 }
 
-static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap)
+void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap)
 {
     if (!data || len == 0 || cap == 0) return;
     if (len >= cap) {
@@ -672,7 +732,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
     return ret;
 }
 
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, void (*on_submit)())
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, std::function<void()> on_submit)
 {
     if (!s_started || !pdu) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -751,7 +811,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
     return ret;
 }
 
-static bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* out = nullptr)
+bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* out = nullptr)
 {
     std::string resp;
     esp_err_t err = idf_modem_send_at(cmd, timeout_ms, resp);
@@ -759,7 +819,7 @@ static bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* ou
     return err == ESP_OK;
 }
 
-static std::string query_imei_from_modem(void)
+std::string query_imei_from_modem(void)
 {
     // ML307R 的裸 AT+CGSN 可能返回模组序列号；只有带参数的标准 IMEI 查询才作为候选。
     static constexpr const char* kCommands[] = {"AT+CGSN=1", "AT+GSN=1"};
@@ -773,7 +833,7 @@ static std::string query_imei_from_modem(void)
 }
 
 // 只从 ICCID 响应行或完整裸卡号读取，不能把夹杂的短信 PDU/IMSI 数字段当成凭据主键。
-static std::string parse_iccid_response(const std::string& raw)
+std::string parse_iccid_response(const std::string& raw)
 {
     size_t pos = 0;
     bool skip_sms_payload = false;
@@ -811,7 +871,7 @@ static std::string parse_iccid_response(const std::string& raw)
 
 // 失败时只记响应形状，不输出卡号、短信正文或任何原始响应片段。
 // 区分只有 OK、缺少目标行、非十进制字符和字段长度，便于真机反馈定位。
-static void log_identity_response_shape(const char* query, const std::string& raw, const char* token)
+void log_identity_response_shape(const char* query, const std::string& raw, const char* token)
 {
     size_t marker = raw.find(token);
     std::string payload;
@@ -842,7 +902,7 @@ static void log_identity_response_shape(const char* query, const std::string& ra
         idf_logf("COPS 状态诊断: fields=%d mode=%d format=%d", count, mode, format);
     }
 }
-static std::string parse_iccid_crsm_response(const std::string& raw)
+std::string parse_iccid_crsm_response(const std::string& raw)
 {
     size_t marker = raw.find("+CRSM:");
     if (marker == std::string::npos) return {};
@@ -870,7 +930,7 @@ static std::string parse_iccid_crsm_response(const std::string& raw)
     return idf_normalize_iccid(value);
 }
 
-static std::string query_current_iccid(void)
+std::string query_current_iccid(void)
 {
     static constexpr const char* kCommands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
     std::string response;
@@ -894,7 +954,7 @@ static std::string query_current_iccid(void)
     return iccid;
 }
 
-static std::string query_sim_state(void)
+std::string query_sim_state(void)
 {
     std::string resp;
     if (!send_ok("AT+CPIN?", 1500, &resp)) {
@@ -917,7 +977,7 @@ static std::string query_sim_state(void)
     return "other";
 }
 
-static void set_sim_status(const std::string& state, bool matched, const std::string& message,
+void set_sim_status(const std::string& state, bool matched, const std::string& message,
                            const std::string& iccid = {})
 {
     IdfModemStatus patch;
@@ -934,11 +994,8 @@ static constexpr bool sim_unlock_allowed(bool has_secret, uint8_t failed, uint8_
 {
     return has_secret && failed < limit && (!puk || user_confirmed);
 }
-static_assert(sim_unlock_allowed(true, 0, 1, false, false), "PIN 应允许自动首次尝试");
-static_assert(!sim_unlock_allowed(true, 1, 1, false, false), "达到上限后必须停止 PIN");
-static_assert(!sim_unlock_allowed(true, 0, 1, true, false), "PUK 不得自动尝试");
 
-static bool try_unlock_sim(bool allow_puk)
+bool try_unlock_sim(bool allow_puk)
 {
     send_ok("ATE0", 1000);
     send_ok("AT+CMEE=1", 1200);
@@ -966,7 +1023,7 @@ static bool try_unlock_sim(bool allow_puk)
         set_sim_status(state, false, "锁卡状态下无法读取 ICCID，未尝试任何密码");
         return false;
     }
-    IdfSimUnlockView view = idf_config_get_sim_unlock_view(iccid);
+    IdfSimUnlockView view = idf_config_get_sim_unlock_view(sim_, iccid);
     if (!view.found) {
         set_sim_status(state, false, "当前 ICCID 没有匹配的凭据", iccid);
         return false;
@@ -1006,21 +1063,21 @@ static bool try_unlock_sim(bool allow_puk)
         ready = query_sim_state() == "ready";
     }
     if (ready) {
-        idf_config_record_sim_unlock_result(iccid, puk, true);
-        if (puk) idf_config_record_sim_unlock_result(iccid, false, true);
+        idf_config_record_sim_unlock_result(sim_, iccid, puk, true);
+        if (puk) idf_config_record_sim_unlock_result(sim_, iccid, false, true);
         s_last_pin_attempt_key.clear();
         set_sim_status("ready", true, puk ? "PUK 解锁成功" : "PIN 自动解锁成功", iccid);
         idf_log_line(puk ? "SIM PUK 手动解锁成功" : "SIM PIN 自动解锁成功");
         return true;
     }
-    if (submit_err == ESP_FAIL) idf_config_record_sim_unlock_result(iccid, puk, false);
+    if (submit_err == ESP_FAIL) idf_config_record_sim_unlock_result(sim_, iccid, puk, false);
     set_sim_status(state, true, std::string(puk ? "PUK" : "PIN") +
                    (submit_err == ESP_FAIL ? " 被模组拒绝，已停止继续尝试" : " 提交超时，未计入密码错误"), iccid);
     idf_log_line(puk ? "SIM PUK 解锁未成功，已停止继续尝试" : "SIM PIN 解锁未成功，已停止继续尝试");
     return false;
 }
 
-static bool parse_csq(const std::string& resp, int& csq, int& ber)
+bool parse_csq(const std::string& resp, int& csq, int& ber)
 {
     size_t p = resp.find("+CSQ:");
     if (p == std::string::npos) return false;
@@ -1037,7 +1094,7 @@ static bool parse_csq(const std::string& resp, int& csq, int& ber)
     return true;
 }
 
-static bool parse_cereg(const std::string& resp, int& stat)
+bool parse_cereg(const std::string& resp, int& stat)
 {
     size_t p = resp.find("+CEREG:");
     if (p == std::string::npos) return false;
@@ -1066,7 +1123,7 @@ static bool parse_cereg(const std::string& resp, int& stat)
 }
 
 // 只接受独立的 COPS 查询行；空名称合法，格式未知时绝不猜测或改写模组状态。
-static bool parse_cops(const std::string& resp, int& format, std::string& oper)
+bool parse_cops(const std::string& resp, int& format, std::string& oper)
 {
     format = -1;
     oper.clear();
@@ -1119,7 +1176,7 @@ static bool parse_cops(const std::string& resp, int& format, std::string& oper)
     return true;
 }
 
-static std::string cops_display(int format, const std::string& oper)
+std::string cops_display(int format, const std::string& oper)
 {
     if (format == 0 || format == 1) return oper;
     if (format != 2 || (oper.size() != 5 && oper.size() != 6)) return {};
@@ -1185,7 +1242,7 @@ esp_err_t idf_modem_get_operator(std::string& name)
     return err;
 }
 
-static std::string query_operator_from_modem(void)
+std::string query_operator_from_modem(void)
 {
     std::string name;
     esp_err_t err = idf_modem_get_operator(name);
@@ -1193,7 +1250,7 @@ static std::string query_operator_from_modem(void)
     return name;
 }
 
-static std::string parse_apn(const std::string& resp)
+std::string parse_apn(const std::string& resp)
 {
     size_t pos = 0;
     while (true) {
@@ -1215,7 +1272,7 @@ static std::string parse_apn(const std::string& resp)
 // 部分模组/卡会把国际 TOA 字节 0x91 误解成 BCD 数字，导致 CNUM 号码出现
 // "+19..." 前缀，例如 +1944756... 实际应为 +44756...。这里只在 "19" 后
 // 紧跟常见国家/地区码时剥离，避免误伤真实 NANP 号码。
-static std::string normalize_msisdn(std::string phone)
+std::string normalize_msisdn(std::string phone)
 {
     size_t start = 0;
     while (start < phone.size() && isspace(static_cast<unsigned char>(phone[start]))) ++start;
@@ -1264,7 +1321,7 @@ static std::string normalize_msisdn(std::string phone)
     return phone;
 }
 
-static std::string parse_cnum_phone(const std::string& resp)
+std::string parse_cnum_phone(const std::string& resp)
 {
     size_t p = resp.find("+CNUM:");
     if (p == std::string::npos) return {};
@@ -1279,19 +1336,19 @@ static std::string parse_cnum_phone(const std::string& resp)
     return normalize_msisdn(phone);
 }
 
-static bool starts_with(const std::string& text, const char* prefix)
+bool starts_with(const std::string& text, const char* prefix)
 {
     return text.rfind(prefix, 0) == 0;
 }
 
-static char hex_nibble(uint8_t value)
+char hex_nibble(uint8_t value)
 {
     value &= 0x0f;
     return value < 10 ? static_cast<char>('0' + value)
                       : static_cast<char>('A' + value - 10);
 }
 
-static std::string hex_encode_ascii(const std::string& text)
+std::string hex_encode_ascii(const std::string& text)
 {
     std::string out;
     out.reserve(text.size() * 2);
@@ -1302,7 +1359,7 @@ static std::string hex_encode_ascii(const std::string& text)
     return out;
 }
 
-static bool parse_http_url(const std::string& raw_url, std::string& protocol,
+bool parse_http_url(const std::string& raw_url, std::string& protocol,
                            std::string& host, std::string& path, std::string& error)
 {
     std::string url = idf_util_trim_copy(raw_url);
@@ -1347,7 +1404,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     return true;
 }
 
-static void normalize_keepalive_url(std::string& protocol, const std::string& host,
+void normalize_keepalive_url(std::string& protocol, const std::string& host,
                                     std::string& path)
 {
     if (host != "gg.incrafttime.top") return;
@@ -1359,7 +1416,7 @@ static void normalize_keepalive_url(std::string& protocol, const std::string& ho
     }
 }
 
-static void append_no_cache_query(std::string& path)
+void append_no_cache_query(std::string& path)
 {
     path += (path.find('?') == std::string::npos) ? '?' : '&';
     char buf[48];
@@ -1369,7 +1426,7 @@ static void append_no_cache_query(std::string& path)
     path += buf;
 }
 
-static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
+esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
                                 std::string& response, size_t max_capture = 1400,
                                 uint32_t extra_read_ms = 50)
 {
@@ -1411,7 +1468,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
     return ret;
 }
 
-static bool send_at_data_locked(const std::string& cmd, const std::string& data, std::string& response)
+bool send_at_data_locked(const std::string& cmd, const std::string& data, std::string& response)
 {
     if (send_at_locked(cmd, 3000, response) != ESP_OK) return false;
     if (uart_write_bytes(MODEM_UART, data.data(), data.size()) != static_cast<int>(data.size())) return false;
@@ -1431,7 +1488,7 @@ static bool send_at_data_locked(const std::string& cmd, const std::string& data,
     return false;
 }
 
-static int parse_mhttp_create_id(const std::string& resp)
+int parse_mhttp_create_id(const std::string& resp)
 {
     size_t p = resp.find("+MHTTPCREATE:");
     if (p == std::string::npos) return -1;
@@ -1446,7 +1503,7 @@ static int parse_mhttp_create_id(const std::string& resp)
 }
 
 // ML307 MHTTP 错误码；PDP 有地址不代表 DNS 或目标服务器可达。
-static const char* mhttp_error_detail(int code)
+const char* mhttp_error_detail(int code)
 {
     switch (code) {
     case 1: return "域名解析失败，请检查域名及蜂窝 APN/DNS";
@@ -1463,7 +1520,7 @@ static const char* mhttp_error_detail(int code)
     }
 }
 
-static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHttpResult& result,
+void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHttpResult& result,
                              bool& complete, bool& error)
 {
     size_t comma = head.find(',');
@@ -1500,7 +1557,7 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
     }
 }
 
-static int comma_count(const std::string& text)
+int comma_count(const std::string& text)
 {
     int count = 0;
     for (char ch : text) {
@@ -1509,7 +1566,7 @@ static int comma_count(const std::string& text)
     return count;
 }
 
-static bool send_mhttp_header_locked(int http_id, bool more, const std::string& line)
+bool send_mhttp_header_locked(int http_id, bool more, const std::string& line)
 {
     char head[64];
     snprintf(head, sizeof(head), "AT+MHTTPHEADER=%d,%d,%u,\"",
@@ -1521,7 +1578,7 @@ static bool send_mhttp_header_locked(int http_id, bool more, const std::string& 
     return send_at_locked(cmd, 3000, resp) == ESP_OK;
 }
 
-static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_bytes,
+bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_bytes,
                                        IdfCellularHttpResult& result,
                                        const std::string& initial_response)
 {
@@ -1593,7 +1650,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_
            result.bytesRead >= min_bytes;
 }
 
-static bool valid_ip_address(const std::string& value)
+bool valid_ip_address(const std::string& value)
 {
     uint8_t address[16] = {};
     int family = value.find(':') == std::string::npos ? AF_INET : AF_INET6;
@@ -1602,7 +1659,7 @@ static bool valid_ip_address(const std::string& value)
     return std::any_of(address, address + size, [](uint8_t byte) { return byte != 0; });
 }
 
-static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
+bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
 {
     size_t p = resp.find("+CGPADDR:");
     if (p == std::string::npos) return false;
@@ -1623,13 +1680,13 @@ static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
     return false;
 }
 
-static bool apn_valid_for_at(const std::string& apn)
+bool apn_valid_for_at(const std::string& apn)
 {
     return apn.size() <= 96 && apn.find('"') == std::string::npos &&
            apn.find('\r') == std::string::npos && apn.find('\n') == std::string::npos;
 }
 
-static bool sample_cell_ip_once(void)
+bool sample_cell_ip_once(void)
 {
     std::string resp;
     std::string ip;
@@ -1642,7 +1699,7 @@ static bool sample_cell_ip_once(void)
     return false;
 }
 
-static bool wait_pdp_ready_locked(uint32_t timeout_ms, std::string& ip)
+bool wait_pdp_ready_locked(uint32_t timeout_ms, std::string& ip)
 {
     TickDeadline deadline(timeout_ms);
     while (!deadline.expired()) {
@@ -1660,7 +1717,7 @@ static bool wait_pdp_ready_locked(uint32_t timeout_ms, std::string& ip)
     return false;
 }
 
-static bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
+bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
 {
     size_t line_pos = resp.find("\"scell\"");
     if (line_pos == std::string::npos) return false;
@@ -1705,7 +1762,7 @@ static bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
     return got;
 }
 
-static bool parse_cesq_signal(const std::string& resp, IdfModemStatus& patch)
+bool parse_cesq_signal(const std::string& resp, IdfModemStatus& patch)
 {
     size_t p = resp.find("+CESQ:");
     if (p == std::string::npos) return false;
@@ -1728,7 +1785,7 @@ static bool parse_cesq_signal(const std::string& resp, IdfModemStatus& patch)
     return got;
 }
 
-static void sample_signal_detail_once(void)
+void sample_signal_detail_once(void)
 {
     IdfModemStatus current = idf_modem_get_status();
     if (!current.modemReady) return;
@@ -1750,7 +1807,7 @@ static void sample_signal_detail_once(void)
     update_status(patch, false, true);
 }
 
-static bool model_skips_cgact(void)
+bool model_skips_cgact(void)
 {
     IdfModemStatus status = idf_modem_get_status();
     if (status.model == "ML307Y") return true;
@@ -1765,7 +1822,7 @@ static bool model_skips_cgact(void)
     return model == "ML307Y";
 }
 
-static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
+bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
                                             uint32_t inactive_timeout_ms)
 {
     std::string resp;
@@ -1797,7 +1854,7 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
 // 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
 // 此开关只控制数据 PDP；短信是否可用由 SIM、模组和运营商短信承载共同决定，
 // 不能仅凭 CEREG/CREG 中的某一个状态判断。归属网络(stat=1)不干预，按常规激活。
-static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
+void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
 {
     if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
     if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
@@ -1809,20 +1866,20 @@ static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
     }
 }
 
-static void schedule_data_mode_retry(void)
+void schedule_data_mode_retry(void)
 {
     s_data_mode_retry_pending = true;
     s_data_mode_retry_count = 0;
     s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
 }
 
-static void apply_startup_data_mode(void)
+void apply_startup_data_mode(void)
 {
     if (model_skips_cgact()) {
         idf_log_line("该型号跳过启动 CGACT 配置");
         return;
     }
-    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
+    IdfSimSettingsView cfg = idf_config_get_sim_settings_view(sim_);
     bool ok = apply_configured_data_mode_once(cfg, 6000, 2500);
     if (ok) {
         idf_log_line(cfg.dataEnabled ? "已按配置启用蜂窝数据(AT+CGACT=1,1)"
@@ -1834,7 +1891,7 @@ static void apply_startup_data_mode(void)
     }
 }
 
-static bool plmn_valid(const std::string& plmn)
+bool plmn_valid(const std::string& plmn)
 {
     if (plmn.empty()) return true;
     if (plmn.size() < 5 || plmn.size() > 6) return false;
@@ -1844,7 +1901,7 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
+void apply_operator_if_configured(const IdfSimSettingsView& cfg)
 {
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
@@ -1860,14 +1917,14 @@ static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
              err == ESP_OK ? "成功" : "失败(可能不可达)");
 }
 
-static bool process_data_mode_retry(void)
+bool process_data_mode_retry(void)
 {
     if (!s_data_mode_retry_pending) return false;
     if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // 回绕安全
     if (!at_channel_idle_now()) return false;
 
     ++s_data_mode_retry_count;
-    IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
+    IdfSimSettingsView cfg = idf_config_get_sim_settings_view(sim_);
     bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
     if (ok) {
         s_data_mode_retry_pending = false;
@@ -1882,7 +1939,7 @@ static bool process_data_mode_retry(void)
     return true;
 }
 
-static bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
+bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
                                     const std::string& path, const char* method,
                                     const char* content_type, const std::string& body,
                                     uint32_t min_response_bytes, IdfCellularHttpResult& result)
@@ -1956,7 +2013,7 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
 }
 
 // 保号只临时激活 PDP，不写入持久配置；关闭失败必须让调用方看见。
-static bool restore_cellular_data_locked(bool data_enabled, IdfCellularHttpResult& result)
+bool restore_cellular_data_locked(bool data_enabled, IdfCellularHttpResult& result)
 {
     if (data_enabled) return true;
     std::string resp;
@@ -1974,7 +2031,7 @@ static bool restore_cellular_data_locked(bool data_enabled, IdfCellularHttpResul
     return false;
 }
 
-static esp_err_t cellular_http_request_impl(const std::string& url, const char* method,
+esp_err_t cellular_http_request_impl(const std::string& url, const char* method,
                                             const char* content_type, const std::string& body,
                                             const IdfCellularHttpConfig& config,
                                             uint32_t min_response_bytes, bool keepalive,
@@ -2064,7 +2121,7 @@ esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* me
     return cellular_http_request_impl(url, method, content_type, body, config, 0, false, result);
 }
 
-static void sample_signal_once(void)
+void sample_signal_once(void)
 {
     std::string resp;
     if (!send_ok("AT+CSQ", 1000, &resp)) return;
@@ -2077,7 +2134,7 @@ static void sample_signal_once(void)
     update_status(patch, false, true);
 }
 
-static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true,
+bool sample_identity_once(bool log_summary = false, bool include_network_fields = true,
                                  bool refresh_missing_phone = false)
 {
     IdfModemStatus before = idf_modem_get_status();
@@ -2178,7 +2235,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     return changed;
 }
 
-static void modem_en_gpio_init(void)
+void modem_en_gpio_init(void)
 {
     gpio_config_t io = {};
     io.pin_bit_mask = 1ULL << MODEM_EN;
@@ -2192,14 +2249,14 @@ static void modem_en_gpio_init(void)
 // 只拉高 EN 保持/接通供电，不做断电周期(热启动探测用)。
 // 先写输出寄存器再配方向：gpio_config 切到输出的瞬间即输出高，
 // 避免默认输出 0 造成 EN 瞬时拉低、给在运行的模组一个断电毛刺
-static void modem_power_hold_on(void)
+void modem_power_hold_on(void)
 {
     gpio_set_level(MODEM_EN, 1);
     modem_en_gpio_init();
     gpio_set_level(MODEM_EN, 1);
 }
 
-static void modem_power_cycle(void)
+void modem_power_cycle(void)
 {
     modem_en_gpio_init();
 
@@ -2210,7 +2267,7 @@ static void modem_power_cycle(void)
     vTaskDelay(pdMS_TO_TICKS(MODEM_POWERUP_MIN_MS));
 }
 
-static bool wait_at_ready(void)
+bool wait_at_ready(void)
 {
     TickDeadline deadline(MODEM_POWERUP_MAX_MS);
     while (!deadline.expired()) {
@@ -2220,7 +2277,7 @@ static bool wait_at_ready(void)
     return false;
 }
 
-static bool modem_hot_start_allowed(esp_reset_reason_t reason)
+bool modem_hot_start_allowed(esp_reset_reason_t reason)
 {
     switch (reason) {
         case ESP_RST_PANIC:
@@ -2234,7 +2291,7 @@ static bool modem_hot_start_allowed(esp_reset_reason_t reason)
     }
 }
 
-static bool modem_quick_start_allowed(esp_reset_reason_t reason)
+bool modem_quick_start_allowed(esp_reset_reason_t reason)
 {
     switch (reason) {
         case ESP_RST_POWERON:
@@ -2248,7 +2305,7 @@ static bool modem_quick_start_allowed(esp_reset_reason_t reason)
 
 // 解析 AT+CPMS 设置命令的响应 "+CPMS: <used1>,<total1>,<used2>,<total2>,<used3>,<total3>"，
 // 输出 <mem1> 总容量。查询响应(+CPMS: "SM",0,0,...)带引号存储名会解析失败，恰好只匹配设置响应。
-static bool parse_cpms_total(const std::string& resp, long& total)
+bool parse_cpms_total(const std::string& resp, long& total)
 {
     size_t p = resp.find("+CPMS:");
     if (p == std::string::npos) return false;
@@ -2262,7 +2319,7 @@ static bool parse_cpms_total(const std::string& resp, long& total)
     return true;
 }
 
-static int sms_storage_code(const char* name)
+int sms_storage_code(const char* name)
 {
     if (strcmp(name, "MT") == 0) return 0;
     if (strcmp(name, "ME") == 0) return 1;
@@ -2270,7 +2327,7 @@ static int sms_storage_code(const char* name)
     return -1;
 }
 
-static void log_sms_storage_if_changed(const char* name)
+void log_sms_storage_if_changed(const char* name)
 {
     int current = sms_storage_code(name);
     int previous = s_logged_sms_storage_code.exchange(current, std::memory_order_relaxed);
@@ -2282,7 +2339,7 @@ static void log_sms_storage_if_changed(const char* name)
 // 按优先级选择短信存储：MT → ME → SM。部分可写 eSIM 的 SM 存储返回 OK 但容量为
 // 0,0(issue #3)，此时短信实际无处可存，必须视为不可用并继续尝试下一候选；
 // 响应里解析不出容量的按可用处理(不同固件设置命令可能只回 OK)。
-static bool select_sms_storage(void)
+bool select_sms_storage(void)
 {
     static const struct { const char* cmd; const char* name; } kCandidates[] = {
         {"AT+CPMS=\"MT\",\"MT\",\"MT\"", "MT"},
@@ -2307,9 +2364,9 @@ static bool select_sms_storage(void)
 // 存储选择失败待补跑标志：冷启动时 CPMS 早于 SIM 就绪执行，SIM 初始化慢的开机
 // 可能三个候选全失败(SIM busy)。注册成功意味着 SIM 必已就绪，届时补跑一次。
 // 只在 modem_task 上下文读写，无需原子量。
-static bool s_sms_storage_pending = false;
+bool s_sms_storage_pending = false;
 
-static void retry_sms_storage_if_pending(void)
+void retry_sms_storage_if_pending(void)
 {
     if (!s_sms_storage_pending) return;
     idf_log_line("SIM 已就绪，补跑短信存储选择");
@@ -2325,7 +2382,7 @@ void idf_modem_reassert_sms_storage(void)
     select_sms_storage();
 }
 
-static bool configure_sms_and_registration(void)
+bool configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
     send_ok("AT+CMEE=1", 1200);  // 明确返回 +CMS/+CME 数字错误，避免只有笼统 ERROR
@@ -2343,16 +2400,20 @@ static bool configure_sms_and_registration(void)
     send_ok("AT+CEREG=2", 1200);
     // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
     // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
-    send_ok("AT+CLIP=1", 1200);
+    std::string voice_response;
+    const bool voice = send_ok("AT+CLIP=1", 1200, &voice_response);
+    const size_t cme = voice_response.rfind("+CME ERROR:");
+    const bool unsupported = cme != std::string::npos && idf_util_trim_copy(voice_response.substr(cme + 11)) == "4";
+    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) { s_status.callCapability = voice ? 1 : (unsupported ? -1 : 0); xSemaphoreGive(s_status_mutex); }
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
-    send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
+    send_ok(idf_config_net_led_enabled(sim_) ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
     bool sms_ready = phase2_ok && pdu_mode_ok && storage_ok && cnmi_ok;
     if (!sms_ready) idf_log_line("短信收发配置未完整生效，将在后续健康检查中重试");
     return sms_ready;
 }
 
-static bool response_has_compact(std::string response, const char* expected)
+bool response_has_compact(std::string response, const char* expected)
 {
     response.erase(std::remove_if(response.begin(), response.end(), [](unsigned char ch) {
         return isspace(ch);
@@ -2360,7 +2421,7 @@ static bool response_has_compact(std::string response, const char* expected)
     return response.find(expected) != std::string::npos;
 }
 
-static void query_sms_receive_config(bool& phase2, bool& pdu, bool& cnmi)
+void query_sms_receive_config(bool& phase2, bool& pdu, bool& cnmi)
 {
     std::string resp;
     phase2 = send_ok("AT+CSMS?", 1200, &resp) && response_has_compact(resp, "+CSMS:1,");
@@ -2422,7 +2483,7 @@ bool idf_modem_sms_health_check(std::string& summary)
 }
 
 // 锁 PIN/PUK 的 SIM 仍然在位，热插拔检测不能把它当成拔卡并触发重启循环。
-static bool query_sim_present(void)
+bool query_sim_present(void)
 {
     std::string state = query_sim_state();
     return state != "absent" && state != "unknown";
@@ -2431,15 +2492,16 @@ static bool query_sim_present(void)
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
 // (ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
-static bool s_reinit_pending = false;
+bool s_reinit_pending = false;
 
-static bool handle_reset_request_if_any(void)
+bool handle_reset_request_if_any(void)
 {
     // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；切卡成功后 idf_esim 请求的软重启
     // 会等到 APDU 会话结束(深度归零)才执行。
     if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
+    transaction_epoch_.fetch_add(1);
 
     IdfModemStatus patch;
     patch.phase = "powering";
@@ -2478,7 +2540,7 @@ static bool handle_reset_request_if_any(void)
 }
 
 // AT 恢复后的补初始化（配合 s_reinit_pending）
-static void run_pending_reinit_if_recovered(void)
+void run_pending_reinit_if_recovered(void)
 {
     if (!s_reinit_pending) return;
     if (!at_channel_idle_now()) return;
@@ -2498,7 +2560,7 @@ static void run_pending_reinit_if_recovered(void)
     s_reinit_pending = false;
 }
 
-static void modem_task(void*)
+void modem_task(void*)
 {
     IdfModemStatus patch;
     patch.started = true;
@@ -2589,7 +2651,7 @@ static void modem_task(void*)
         set_phase("failed");
     } else {
         retry_sms_storage_if_pending();
-        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
+        IdfSimSettingsView cfg = idf_config_get_sim_settings_view(sim_);
         apply_operator_if_configured(cfg);
         if (cfg.dataEnabled) sample_cell_ip_once();
         enforce_roaming_data_policy(cfg, stat);
@@ -2613,6 +2675,7 @@ static void modem_task(void*)
     int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
     while (true) {
+        service_commands();
         bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
         if (!sim_ready && idf_modem_get_status().simState == "ready") sim_ready = true;
@@ -2696,7 +2759,7 @@ static void modem_task(void*)
                 sample_request = s_status_sampling.begin();
                 idf_log_line("模组信息刷新开始");
             }
-            const IdfSimSettingsView sim_cfg = idf_config_get_sim_settings_view();
+            const IdfSimSettingsView sim_cfg = idf_config_get_sim_settings_view(sim_);
             if (sim_cfg.dataEnabled && idf_modem_get_status().cellIp.empty() &&
                 (last_cell_ip == 0 ||
                  now - last_cell_ip > pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS))) {
@@ -2761,7 +2824,7 @@ static void modem_task(void*)
                         // 掉网后恢复可能意味着模组自发复位过：存储选择无条件重跑，
                         // 不能只看 pending 标志(初次成功后它恒为 false)
                         if (!sms_reconfigured_now) s_sms_storage_pending = !select_sms_storage();
-                        IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
+                        IdfSimSettingsView cfg = idf_config_get_sim_settings_view(sim_);
                         apply_operator_if_configured(cfg);
                         if (cfg.dataEnabled) sample_cell_ip_once();
                         enforce_roaming_data_policy(cfg, stat);
@@ -2865,14 +2928,15 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     s_last_pin_attempt_key.clear();
     // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 AT 通道，同任务内的单条 AT 再递归取锁。
     s_at_mutex = xSemaphoreCreateRecursiveMutex();
+    session_mutex_ = xSemaphoreCreateRecursiveMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_urc_mutex = xSemaphoreCreateMutex();
     if (!s_event_sem) s_event_sem = xSemaphoreCreateBinary();
-    if (!s_at_mutex || !s_status_mutex || !s_urc_mutex || !s_event_sem) {
+    if (!session_mutex_ || !s_at_mutex || !s_status_mutex || !s_urc_mutex || !s_event_sem) {
         cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
-    if (!config.dataEnabled) set_status_cell_ip("");
+    if (!idf_config_modem(config, sim_).dataEnabled) set_status_cell_ip("");
 
     uart_config_t uart_cfg = {};
     uart_cfg.baud_rate = MODEM_BAUD;
@@ -2909,9 +2973,11 @@ esp_err_t idf_modem_start(const IdfConfig& config)
         return err;
     }
     uart_flush_input(MODEM_UART);
+    commands_ = xQueueCreate(4, sizeof(Command*));
+    if (!commands_) { uart_driver_delete(MODEM_UART); cleanup_start_resources(); return ESP_ERR_NO_MEM; }
     s_started = true;
 
-    BaseType_t ok = xTaskCreate(modem_task, "idf_modem", 8192, nullptr, 4, nullptr);
+    BaseType_t ok = xTaskCreate([](void* p) { auto* self = static_cast<ModemInstance*>(p); self->owner_ = xTaskGetCurrentTaskHandle(); self->modem_task(nullptr); }, sim_ == 1 ? "modem1" : "modem2", 8192, this, 4, &owner_);
     if (ok != pdPASS) {
         s_started = false;
         uart_driver_delete(MODEM_UART);
@@ -2930,6 +2996,7 @@ IdfModemStatus idf_modem_get_status(void)
         copy = s_status;
         xSemaphoreGive(s_status_mutex);
     }
+    if (owner_) copy.stackFree = uxTaskGetStackHighWaterMark(owner_);
     copy.sampleRequested = s_status_sampling.requested();
     copy.sampleCompleted = s_status_sampling.completed();
     copy.sampleRunning = s_status_sampling.running();
@@ -2962,6 +3029,7 @@ esp_err_t idf_modem_get_imei(std::string& imei)
 esp_err_t idf_modem_request_reset(bool hard_reset)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
+    transaction_epoch_.fetch_add(1);
     s_reset_request.store(hard_reset ? 2 : 1, std::memory_order_relaxed);
     set_phase("powering");
     return ESP_OK;
@@ -2989,14 +3057,16 @@ void idf_modem_request_status_sample(void)
 
 void idf_modem_begin_esim_operation(void)
 {
+    if (session_mutex_) xSemaphoreTakeRecursive(session_mutex_, portMAX_DELAY);
     s_esim_operation_depth.fetch_add(1, std::memory_order_relaxed);
-    if (s_at_mutex) xSemaphoreTakeRecursive(s_at_mutex, portMAX_DELAY);
+    session_owner_.store(xTaskGetCurrentTaskHandle());
 }
 
 void idf_modem_end_esim_operation(void)
 {
-    if (s_at_mutex) xSemaphoreGiveRecursive(s_at_mutex);
-    s_esim_operation_depth.fetch_sub(1, std::memory_order_relaxed);
+    if (session_owner_.load() != xTaskGetCurrentTaskHandle()) return;
+    if (s_esim_operation_depth.fetch_sub(1, std::memory_order_relaxed) == 1) session_owner_.store(nullptr);
+    if (session_mutex_) xSemaphoreGiveRecursive(session_mutex_);
 }
 
 bool idf_modem_esim_operation_active(void)
@@ -3004,7 +3074,7 @@ bool idf_modem_esim_operation_active(void)
     return s_esim_operation_depth.load(std::memory_order_relaxed) != 0;
 }
 
-static std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};
+std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};
 
 void idf_modem_set_sim_identity_hook(void (*hook)(void))
 {
@@ -3016,6 +3086,7 @@ void idf_modem_invalidate_sim_identity(void)
     // 清除随卡变化的身份字段：切/启/禁 eSIM Profile 后当前生效的卡已不同，
     // 但 sample_identity_once 对非空字段跳过重读，会一直沿用旧卡的号码/ICCID/运营商。
     if (s_status_mutex && xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        ++s_status.generation;
         s_status.iccid.clear();
         s_status.imsi.clear();
         s_status.phone.clear();
@@ -3067,3 +3138,309 @@ bool idf_modem_take_urc(std::string& out)
     xSemaphoreGive(s_urc_mutex);
     return !out.empty();
 }
+
+};
+
+static ModemInstance modem_instances[2] = {ModemInstance(1), ModemInstance(2)};
+
+esp_err_t idf_modem_send_at(IdfModemId sim, const std::string& cmd, uint32_t timeout_ms, std::string& response, uint32_t expected_generation)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_send_at(cmd, timeout_ms, response); }, expected_generation);
+}
+
+esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
+{
+    return idf_modem_send_at(IDF_SIM1, cmd, timeout_ms, response);
+}
+
+esp_err_t idf_modem_send_at_until(IdfModemId sim, const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_send_at_until(cmd, token, timeout_ms, response); });
+}
+
+esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response)
+{
+    return idf_modem_send_at_until(IDF_SIM1, cmd, token, timeout_ms, response);
+}
+
+esp_err_t idf_modem_send_pdu(IdfModemId sim, const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, std::function<void()> on_submit, uint32_t expected_generation)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_send_pdu(cmgs_cmd, pdu, timeout_ms, response, on_submit); }, expected_generation);
+}
+
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, std::function<void()> on_submit)
+{
+    return idf_modem_send_pdu(IDF_SIM1, cmgs_cmd, pdu, timeout_ms, response, on_submit);
+}
+
+esp_err_t idf_modem_get_operator(IdfModemId sim, std::string& name)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_get_operator(name); });
+}
+
+esp_err_t idf_modem_get_operator(std::string& name)
+{
+    return idf_modem_get_operator(IDF_SIM1, name);
+}
+
+esp_err_t idf_modem_cellular_http_get(IdfModemId sim, const std::string& url, const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_cellular_http_get(url, config, result); });
+}
+
+esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result)
+{
+    return idf_modem_cellular_http_get(IDF_SIM1, url, config, result);
+}
+
+esp_err_t idf_modem_cellular_http_request(IdfModemId sim, const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_cellular_http_request(url, method, content_type, body, config, result); });
+}
+
+esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result)
+{
+    return idf_modem_cellular_http_request(IDF_SIM1, url, method, content_type, body, config, result);
+}
+
+void idf_modem_reassert_sms_storage(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.invoke([&] { instance.idf_modem_reassert_sms_storage(); return ESP_OK; });
+}
+
+void idf_modem_reassert_sms_storage(void)
+{
+    idf_modem_reassert_sms_storage(IDF_SIM1);
+}
+
+bool idf_modem_sms_health_check(IdfModemId sim, std::string& summary)
+{
+    if (!idf_modem_id_valid(sim)) return false;
+    auto& instance = modem_instances[sim-1];
+    return (instance.invoke([&] { return instance.idf_modem_sms_health_check(summary) ? ESP_OK : ESP_FAIL; }) == ESP_OK);
+}
+
+bool idf_modem_sms_health_check(std::string& summary)
+{
+    return idf_modem_sms_health_check(IDF_SIM1, summary);
+}
+
+esp_err_t idf_modem_start(IdfModemId sim, const IdfConfig& config)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_start(config);
+}
+
+esp_err_t idf_modem_start(const IdfConfig& config)
+{
+    return idf_modem_start(IDF_SIM1, config);
+}
+
+IdfModemStatus idf_modem_get_status(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return IdfModemStatus{};
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_get_status();
+}
+
+IdfModemStatus idf_modem_get_status(void)
+{
+    return idf_modem_get_status(IDF_SIM1);
+}
+
+esp_err_t idf_modem_get_imei(IdfModemId sim, std::string& imei)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.invoke([&] { return instance.idf_modem_get_imei(imei); });
+}
+
+esp_err_t idf_modem_get_imei(std::string& imei)
+{
+    return idf_modem_get_imei(IDF_SIM1, imei);
+}
+
+esp_err_t idf_modem_request_reset(IdfModemId sim, bool hard_reset)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_request_reset(hard_reset);
+}
+
+esp_err_t idf_modem_request_reset(bool hard_reset)
+{
+    return idf_modem_request_reset(IDF_SIM1, hard_reset);
+}
+
+esp_err_t idf_modem_request_sim_unlock(IdfModemId sim, bool allow_puk)
+{
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_request_sim_unlock(allow_puk);
+}
+
+esp_err_t idf_modem_request_sim_unlock(bool allow_puk)
+{
+    return idf_modem_request_sim_unlock(IDF_SIM1, allow_puk);
+}
+
+bool idf_modem_at_idle(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return false;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_at_idle();
+}
+
+bool idf_modem_at_idle(void)
+{
+    return idf_modem_at_idle(IDF_SIM1);
+}
+
+void idf_modem_request_status_sample(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_request_status_sample();
+}
+
+void idf_modem_request_status_sample(void)
+{
+    idf_modem_request_status_sample(IDF_SIM1);
+}
+
+void idf_modem_begin_esim_operation(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_begin_esim_operation();
+}
+
+void idf_modem_begin_esim_operation(void)
+{
+    idf_modem_begin_esim_operation(IDF_SIM1);
+}
+
+void idf_modem_end_esim_operation(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_end_esim_operation();
+}
+
+void idf_modem_end_esim_operation(void)
+{
+    idf_modem_end_esim_operation(IDF_SIM1);
+}
+
+bool idf_modem_esim_operation_active(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return false;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_esim_operation_active();
+}
+
+bool idf_modem_esim_operation_active(void)
+{
+    return idf_modem_esim_operation_active(IDF_SIM1);
+}
+
+void idf_modem_set_sim_identity_hook(IdfModemId sim, void (*hook)(void))
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_set_sim_identity_hook(hook);
+}
+
+void idf_modem_set_sim_identity_hook(void (*hook)(void))
+{
+    idf_modem_set_sim_identity_hook(IDF_SIM1, hook);
+}
+
+void idf_modem_invalidate_sim_identity(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_invalidate_sim_identity();
+}
+
+void idf_modem_invalidate_sim_identity(void)
+{
+    idf_modem_invalidate_sim_identity(IDF_SIM1);
+}
+
+void idf_modem_power_off_for_restart(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_power_off_for_restart();
+}
+
+void idf_modem_power_off_for_restart(void)
+{
+    idf_modem_power_off_for_restart(IDF_SIM1);
+}
+
+bool idf_modem_wait_event(IdfModemId sim, uint32_t timeout_ms)
+{
+    if (!idf_modem_id_valid(sim)) return false;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_wait_event(timeout_ms);
+}
+
+bool idf_modem_wait_event(uint32_t timeout_ms)
+{
+    return idf_modem_wait_event(IDF_SIM1, timeout_ms);
+}
+
+void idf_modem_signal_event(IdfModemId sim)
+{
+    if (!idf_modem_id_valid(sim)) return ;
+    auto& instance = modem_instances[sim-1];
+    instance.idf_modem_signal_event();
+}
+
+void idf_modem_signal_event(void)
+{
+    idf_modem_signal_event(IDF_SIM1);
+}
+
+bool idf_modem_take_urc(IdfModemId sim, std::string& out)
+{
+    if (!idf_modem_id_valid(sim)) return false;
+    auto& instance = modem_instances[sim-1];
+    return instance.idf_modem_take_urc(out);
+}
+
+bool idf_modem_take_urc(std::string& out)
+{
+    return idf_modem_take_urc(IDF_SIM1, out);
+}
+
+static_assert(ModemInstance::modem_retry_delay_ms(0) == 30000UL, "首次补采应在 30 秒后执行");
+static_assert(ModemInstance::modem_retry_delay_ms(99) == 600000UL, "补采退避上限应为 10 分钟");
+static_assert(ModemInstance::sim_unlock_allowed(true, 0, 1, false, false), "PIN 应允许自动首次尝试");
+static_assert(!ModemInstance::sim_unlock_allowed(true, 1, 1, false, false), "达到上限后必须停止 PIN");
+static_assert(!ModemInstance::sim_unlock_allowed(true, 0, 1, true, false), "PUK 不得自动尝试");

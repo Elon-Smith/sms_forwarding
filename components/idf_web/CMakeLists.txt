@@ -2,6 +2,7 @@ idf_component_register(
   SRCS "idf_web.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    idf_board
     app_update
     esp_partition
     espcoredump

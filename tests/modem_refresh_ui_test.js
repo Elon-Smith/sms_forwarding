@@ -12,7 +12,7 @@ function app() {
   const timers = [], urls = [], notices = [];
   let reply = () => Promise.resolve({ modemSampleRequested: 1, modemSampleCompleted: 0 });
   const context = {
-    console, Date, Promise, URLSearchParams,
+    console, Date, Promise, URLSearchParams, URL, location: {search:'?sim=2', href:'http://device/?sim=2'},
     document: { hidden: false, querySelectorAll: () => [], addEventListener() {},
       getElementById: id => elements[id] || null },
     addEventListener() {},

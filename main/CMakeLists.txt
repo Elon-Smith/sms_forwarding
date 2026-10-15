@@ -2,6 +2,7 @@ idf_component_register(
   SRCS "app_main.cpp"
   INCLUDE_DIRS "."
   REQUIRES
+    idf_network
     esp_event
     esp_netif
     idf_config

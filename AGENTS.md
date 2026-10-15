@@ -1,3 +1,7 @@
+# 当前双模组开发约定
+
+本分支仅基于上游 d4271d46f40bca215d2fba966b83051a1a4460be / ESP-IDF 6.0.2。不得迁入旧本地工程源码或配置。保留上游组件位置，双卡接口显式携带 IdfModemId (1/2)，禁止全局当前卡。引脚集中在 idf_board。旧工程必须在实机验收通过后才能清理；设备计费短信由用户手动执行。下方上游说明与双卡实现冲突时以上述约定和 dev_doc/upstream_dual_modem.md 为准。
+
 # AGENTS.md
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.

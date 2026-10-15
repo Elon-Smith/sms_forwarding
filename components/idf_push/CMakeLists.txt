@@ -2,6 +2,8 @@ idf_component_register(
   SRCS "idf_push.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    idf_network
+    idf_board
     esp_http_client
     esp_timer
     esp-tls

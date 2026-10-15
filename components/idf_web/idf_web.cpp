@@ -1,3 +1,4 @@
+#include "idf_firmware_identity.h"
 #include "idf_web.h"
 #include "scheduled_task_time.h"
 
@@ -17,6 +18,7 @@
 #include "driver/temperature_sensor.h"
 #include "esp_core_dump.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "esp_partition.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -42,10 +44,37 @@
 #include "nvs.h"
 #include "web_assets.h"
 
-static const char* TAG = "idf_web";
-static httpd_handle_t s_server = nullptr;
-static SemaphoreHandle_t s_cell_job_mutex = nullptr;
-static bool s_scheduler_started = false;
+#include <stdarg.h>
+#include "idf_board.h"
+
+class WebInstance {
+public:
+    explicit WebInstance(IdfModemId sim) : sim_(sim) {}
+    const IdfModemId sim_;
+    using Worker = void (WebInstance::*)(void*);
+    struct Dispatch { WebInstance* owner; Worker worker; void* arg; };
+    BaseType_t create_task(Worker worker, const char* name, uint32_t stack, void* arg,
+                          UBaseType_t priority, TaskHandle_t* handle) {
+        auto* ctx = new (std::nothrow) Dispatch{this, worker, arg};
+        if (!ctx) return pdFAIL;
+        BaseType_t ok = ::xTaskCreate([](void* raw) {
+            Dispatch value = *static_cast<Dispatch*>(raw);
+            delete static_cast<Dispatch*>(raw);
+            (value.owner->*value.worker)(value.arg);
+        }, name, stack, ctx, priority, handle);
+        if (ok != pdPASS) delete ctx;
+        return ok;
+    }
+    void idf_log_line(const char* line) { ::idf_logf("[SIM%u] %s", sim_, line); }
+    void idf_logf(const char* format, ...) {
+        char buf[512]; va_list ap; va_start(ap, format);
+        vsnprintf(buf, sizeof(buf), format, ap); va_end(ap);
+        ::idf_logf("[SIM%u] %s", sim_, buf);
+    }
+static constexpr const char* TAG = "idf_web";
+static inline httpd_handle_t s_server = nullptr;
+SemaphoreHandle_t s_cell_job_mutex = nullptr;
+bool s_scheduler_started = false;
 
 struct WebAsyncJob {
     bool running = false;
@@ -62,32 +91,26 @@ struct WebAsyncJob {
 };
 
 struct EsimWebCache {
+    uint32_t generation = 0;
     std::string eid;
     std::vector<IdfEsimProfile> profiles;
     uint32_t updatedAt = 0;
 };
 
-static WebAsyncJob s_ping_job;
-static WebAsyncJob s_keepalive_job;
-static WebAsyncJob s_esim_job;
-static WebAsyncJob s_sched_job;
-static int s_sched_job_index = -1;
-static EsimWebCache s_esim_cache;
+WebAsyncJob s_ping_job;
+WebAsyncJob s_keepalive_job;
+WebAsyncJob s_esim_job;
+WebAsyncJob s_sched_job;
+int s_sched_job_index = -1;
+EsimWebCache s_esim_cache;
 // Confirmation Code 只在等待期间保存在 RAM，绝不放入 WebAsyncJob/status。
-static std::string s_esim_confirmation_code;
-static bool s_esim_confirmation_submitted = false;
-static bool s_modem_apply_running = false;
-static bool s_web_modem_action_running = false;
+std::string s_esim_confirmation_code;
+bool s_esim_confirmation_submitted = false;
+bool s_modem_apply_running = false;
+bool s_web_modem_action_running = false;
 
-static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
-static void cell_job_unlock(void);
-static bool cellular_job_active_locked(void);
-static bool cellular_job_active(void);
-static void set_json_no_cache(httpd_req_t* req);
-static bool valid_ussd_code(const std::string& code);
-static bool run_ussd(const std::string& code, std::string& resp_out);
 
-static void json_prop(std::string& out, const char* key, const std::string& value)
+void json_prop(std::string& out, const char* key, const std::string& value)
 {
     out += "\"";
     out += key;
@@ -96,12 +119,12 @@ static void json_prop(std::string& out, const char* key, const std::string& valu
     out += "\"";
 }
 
-static bool epoch_valid(uint32_t epoch)
+bool epoch_valid(uint32_t epoch)
 {
     return epoch >= 1700000000u;
 }
 
-static bool push_key_sensitive(uint8_t type, int slot)
+bool push_key_sensitive(uint8_t type, int slot)
 {
     if (slot == 1) {
         return type == 2 || type == 4 || type == 5 || type == 6 || type == 8 || type == 9;
@@ -109,7 +132,7 @@ static bool push_key_sensitive(uint8_t type, int slot)
     return slot == 2 && type == 10;
 }
 
-static std::string format_tz_offset(int tz_offset_min)
+std::string format_tz_offset(int tz_offset_min)
 {
     if (tz_offset_min == 0) return "UTC";
     char buf[16];
@@ -124,7 +147,7 @@ static std::string format_tz_offset(int tz_offset_min)
     return std::string(buf);
 }
 
-static std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
+std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
 {
     if (!epoch_valid(epoch)) return std::string();
     time_t shifted = static_cast<time_t>(static_cast<int64_t>(epoch) + static_cast<int64_t>(tz_offset_min) * 60LL);
@@ -139,7 +162,7 @@ static std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
 }
 
 // 芯片内部温度(概览页显示)；驱动懒加载，失败只记一次不再重试
-static bool read_chip_temp(float& out)
+bool read_chip_temp(float& out)
 {
     static temperature_sensor_handle_t s_tsens = nullptr;
     static bool s_tsens_failed = false;
@@ -154,7 +177,7 @@ static bool read_chip_temp(float& out)
     return s_tsens && temperature_sensor_get_celsius(s_tsens, &out) == ESP_OK;
 }
 
-static bool auth_matches_config(const char* auth)
+bool auth_matches_config(const char* auth)
 {
     static constexpr const char* prefix = "Basic ";
     if (strncmp(auth, prefix, strlen(prefix)) != 0) return false;
@@ -177,7 +200,7 @@ static bool auth_matches_config(const char* auth)
 // 配网热点模式下允许免认证访问的接口白名单：只覆盖"进入独立配网页并配好 WiFi"
 // 所需的最小集合。刻意不放行 /ui、/status、/config.json、/assets 等——配网页是
 // 自包含的独立页面，不需要它们；不放行可避免开放热点期间暴露完整后台与已有配置。
-static bool is_ap_open_uri(const char* uri)
+bool is_ap_open_uri(const char* uri)
 {
     if (!uri) return false;
     // 按"路径"精确匹配，忽略 ?query
@@ -198,7 +221,7 @@ static bool is_ap_open_uri(const char* uri)
 //    个别隐私插件剥离 Origin 造成的盲区。
 // 3. Origin 与 Host 不一致拒绝。变更类操作均已强制 POST，GET 一律放行；
 //    curl/脚本不带 Origin 与 Sec-Fetch-Site，不受影响。
-static bool origin_allowed(httpd_req_t* req)
+bool origin_allowed(httpd_req_t* req)
 {
     if (req->method != HTTP_POST) return true;
     char csrf[8] = {};
@@ -219,7 +242,7 @@ static bool origin_allowed(httpd_req_t* req)
     return strcasecmp(host_part, host) == 0;
 }
 
-static bool reject_cross_origin(httpd_req_t* req)
+bool reject_cross_origin(httpd_req_t* req)
 {
     if (origin_allowed(req)) return false;
     idf_log_line("已拦截跨站 POST(Origin 与 Host 不符)");
@@ -229,7 +252,7 @@ static bool reject_cross_origin(httpd_req_t* req)
     return true;
 }
 
-static bool check_auth(httpd_req_t* req)
+bool check_auth(httpd_req_t* req)
 {
     // 配网热点(开放 AP)模式下放行配网所需接口：设备此时是开放无加密热点，系统
     // Captive Portal 探测/弹窗只能拿到 401(显示 "unauthorized")，新用户无从进入
@@ -254,7 +277,7 @@ static bool check_auth(httpd_req_t* req)
 
 // 写接口的跨站兜底：复用 origin_allowed 的分层判定(自定义头/Sec-Fetch-Site/Origin)，
 // 返回 JSON 错误。check_auth 已前置同一校验，这里防的是未来重构改动调用顺序。
-static bool check_csrf(httpd_req_t* req)
+bool check_csrf(httpd_req_t* req)
 {
     if (origin_allowed(req)) return true;
     set_json_no_cache(req);
@@ -263,7 +286,7 @@ static bool check_csrf(httpd_req_t* req)
     return false;
 }
 
-static bool etag_matches(httpd_req_t* req, const WebAsset& asset)
+bool etag_matches(httpd_req_t* req, const WebAsset& asset)
 {
     char inm[96] = {};
     if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) != ESP_OK) {
@@ -272,23 +295,23 @@ static bool etag_matches(httpd_req_t* req, const WebAsset& asset)
     return strstr(inm, asset.etag) != nullptr;
 }
 
-static bool cache_has_token(const char* cache_control, const char* token)
+bool cache_has_token(const char* cache_control, const char* token)
 {
     return cache_control && strstr(cache_control, token) != nullptr;
 }
 
-static void set_no_cache_headers(httpd_req_t* req)
+void set_no_cache_headers(httpd_req_t* req)
 {
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
 }
 
-static void set_json_no_cache(httpd_req_t* req)
+void set_json_no_cache(httpd_req_t* req)
 {
     httpd_resp_set_type(req, "application/json");
     set_no_cache_headers(req);
 }
 
-static bool ensure_get_or_post(httpd_req_t* req)
+bool ensure_get_or_post(httpd_req_t* req)
 {
     if (req->method == HTTP_GET) return true;
     if (req->method == HTTP_POST) return check_csrf(req);
@@ -299,7 +322,7 @@ static bool ensure_get_or_post(httpd_req_t* req)
     return false;
 }
 
-static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const char* cache_control)
+esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const char* cache_control)
 {
     const bool no_store = cache_has_token(cache_control, "no-store");
     httpd_resp_set_hdr(req, "Cache-Control", cache_control);
@@ -318,7 +341,7 @@ static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const 
     return httpd_resp_send(req, reinterpret_cast<const char*>(asset.data), asset.length);
 }
 
-static esp_err_t handle_root(httpd_req_t* req)
+esp_err_t handle_root(httpd_req_t* req)
 {
     // 配网热点模式：只下发自包含的独立配网页(免密)，不加载完整后台，杜绝已有配置暴露
     if (idf_wifi_is_ap_mode()) {
@@ -328,7 +351,7 @@ static esp_err_t handle_root(httpd_req_t* req)
     return send_gzip_asset(req, WEB_INDEX, "no-store, max-age=0");
 }
 
-static esp_err_t handle_asset(httpd_req_t* req)
+esp_err_t handle_asset(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (strstr(req->uri, "/app.css")) {
@@ -341,7 +364,7 @@ static esp_err_t handle_asset(httpd_req_t* req)
     return ESP_OK;
 }
 
-static esp_err_t handle_ui_panel(httpd_req_t* req)
+esp_err_t handle_ui_panel(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
 
@@ -366,7 +389,7 @@ static esp_err_t handle_ui_panel(httpd_req_t* req)
                                                       "private, no-cache, max-age=0");
 }
 
-static esp_err_t handle_status(httpd_req_t* req)
+esp_err_t handle_status(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     char query[32] = {};
@@ -374,15 +397,15 @@ static esp_err_t handle_status(httpd_req_t* req)
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
         httpd_query_key_value(query, "sample", sample, sizeof(sample)) == ESP_OK &&
         strcmp(sample, "1") == 0) {
-        idf_modem_request_status_sample();
+        idf_modem_request_status_sample(sim_);
     }
     set_json_no_cache(req);
 
     // 窄快照：/status 每 2s 轮询一次，避免全量配置深拷贝造成持续堆抖动
-    const IdfConfigStatusView cfg = idf_config_get_status_view();
+    const IdfConfigStatusView cfg = idf_config_get_status_view(sim_);
     IdfWifiStatus wifi = idf_wifi_get_status();
-    IdfModemStatus modem = idf_modem_get_status();
-    IdfSmsStatus sms = idf_sms_get_status();
+    IdfModemStatus modem = idf_modem_get_status(sim_);
+    IdfSmsStatus sms = idf_sms_get_status(sim_);
     time_t now = time(nullptr);
     uint64_t uptime = esp_timer_get_time() / 1000000ULL;
 
@@ -420,7 +443,7 @@ static esp_err_t handle_status(httpd_req_t* req)
     body += buf;
     snprintf(buf, sizeof(buf),
              "\"smsTotal\":%u,\"lastSmsEpoch\":%u,",
-             static_cast<unsigned>(sms.total),
+             static_cast<unsigned>(sms.total + idf_sms_get_status(2).total),
              static_cast<unsigned>(sms.lastSmsEpoch));
     body += buf;
     snprintf(buf, sizeof(buf),
@@ -430,7 +453,7 @@ static esp_err_t handle_status(httpd_req_t* req)
              static_cast<unsigned>(idf_inbox_count()),
              idf_push_forward_queue_depth(),
              idf_push_retry_queue_depth(),
-             idf_sms_outgoing_queue_depth(),
+             idf_sms_outgoing_queue_depth(sim_),
              idf_push_email_queue_depth(),
              idf_push_busy() ? "true" : "false",
              now > 100000 ? "true" : "false");
@@ -501,6 +524,26 @@ static esp_err_t handle_status(httpd_req_t* req)
              static_cast<unsigned long>(modem.sampleRequested),
              static_cast<unsigned long>(modem.sampleCompleted), modem.sampleRunning ? "true" : "false");
     body += buf;
+    body += ",\"firmwareElfSha256\":\"";
+    for (uint8_t byte : esp_app_get_description()->app_elf_sha256) { char hex[3]; snprintf(hex, sizeof(hex), "%02x", byte); body += hex; }
+    body += "\"";
+    body += ",\"sim\":" + std::to_string(sim_) + ",\"modems\":[";
+    for (IdfModemId card = 1; card <= IDF_MODEM_COUNT; ++card) {
+        if (card > 1) body += ",";
+        auto m = idf_modem_get_status(card);
+        auto sms_card = idf_sms_get_status(card);
+        body += "{\"sim\":" + std::to_string(card) + ",\"ready\":" + (m.modemReady ? "true" : "false");
+        body += ",\"generation\":" + std::to_string(m.generation);
+        body += ",\"uartErrors\":" + std::to_string(m.uartErrors);
+        body += ",\"stackFree\":" + std::to_string(m.stackFree);
+        body += ",\"callCapability\":" + std::to_string(m.callCapability);
+        body += ",\"esimCapability\":" + std::to_string(idf_esim_capability(card));
+        body += ",\"smsTotal\":" + std::to_string(sms_card.total) + ",";
+        json_prop(body, "model", m.model); body += ",";
+        json_prop(body, "phase", m.phase); body += ",";
+        json_prop(body, "iccid", m.iccid); body += "}";
+    }
+    body += "]";
     float temp = 0;
     if (read_chip_temp(temp)) {
         snprintf(buf, sizeof(buf), ",\"chipTemp\":%.1f}", static_cast<double>(temp));
@@ -512,12 +555,12 @@ static esp_err_t handle_status(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t send_config_json(httpd_req_t* req)
+esp_err_t send_config_json(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     set_json_no_cache(req);
 
-    const IdfConfigWebView cfg = idf_config_get_web_view();
+    const IdfConfigWebView cfg = idf_config_get_web_view(sim_);
     std::string body;
     body.reserve(4096);
     char buf[256];
@@ -542,7 +585,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
               cfg.emailConfigured ? "true" : "false",
               cfg.pushEnabled ? "true" : "false",
               cfg.pushEnabledCount,
-              idf_modem_get_status().modemReady ? "true" : "false");
+              idf_modem_get_status(sim_).modemReady ? "true" : "false");
     body += buf;
     json_prop(body, "ntpServer", cfg.ntpServer); body += ",";
     json_prop(body, "mdnsHost", cfg.mdnsHost); body += ",";
@@ -634,7 +677,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static int hex_value(char ch)
+int hex_value(char ch)
 {
     if (ch >= '0' && ch <= '9') return ch - '0';
     if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
@@ -642,7 +685,7 @@ static int hex_value(char ch)
     return -1;
 }
 
-static std::string url_decode(const char* data, size_t len)
+std::string url_decode(const char* data, size_t len)
 {
     std::string out;
     out.reserve(len);
@@ -666,7 +709,7 @@ static std::string url_decode(const char* data, size_t len)
     return out;
 }
 
-static esp_err_t read_body(httpd_req_t* req, std::string& body, size_t max_len = 8192)
+esp_err_t read_body(httpd_req_t* req, std::string& body, size_t max_len = 8192)
 {
     if (req->content_len > max_len) {
         set_no_cache_headers(req);
@@ -701,7 +744,7 @@ static esp_err_t read_body(httpd_req_t* req, std::string& body, size_t max_len =
     return ESP_OK;
 }
 
-static void send_modem_busy_json(httpd_req_t* req)
+void send_modem_busy_json(httpd_req_t* req)
 {
     set_json_no_cache(req);
     httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"模组或蜂窝/eSIM 任务正忙，请稍后重试\"}");
@@ -710,41 +753,42 @@ static void send_modem_busy_json(httpd_req_t* req)
 // Web 直接 AT 操作不持有状态锁；只设置一个短暂标记，避免 eSIM/保号事务在两条 AT 间插队。
 class WebModemActionGuard {
 public:
-    WebModemActionGuard() = default;
+    explicit WebModemActionGuard(WebInstance& owner) : owner_(owner) {}
     WebModemActionGuard(const WebModemActionGuard&) = delete;
     WebModemActionGuard& operator=(const WebModemActionGuard&) = delete;
 
     bool begin(httpd_req_t* req)
     {
-        if (!cell_job_lock()) {
-            send_modem_busy_json(req);
+        if (!owner_.cell_job_lock()) {
+            owner_.send_modem_busy_json(req);
             return false;
         }
-        if (cellular_job_active_locked() || !idf_modem_at_idle()) {
-            cell_job_unlock();
-            send_modem_busy_json(req);
+        if (owner_.cellular_job_active_locked() || !idf_modem_at_idle(owner_.sim_)) {
+            owner_.cell_job_unlock();
+            owner_.send_modem_busy_json(req);
             return false;
         }
-        s_web_modem_action_running = true;
+        owner_.s_web_modem_action_running = true;
         m_active = true;
-        cell_job_unlock();
+        owner_.cell_job_unlock();
         return true;
     }
 
     ~WebModemActionGuard()
     {
         if (!m_active) return;
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_web_modem_action_running = false;
-            cell_job_unlock();
+        if (owner_.cell_job_lock(portMAX_DELAY)) {
+            owner_.s_web_modem_action_running = false;
+            owner_.cell_job_unlock();
         }
     }
 
 private:
+    WebInstance& owner_;
     bool m_active = false;
 };
 
-static IdfFormFields parse_urlencoded(const std::string& body)
+IdfFormFields parse_urlencoded(const std::string& body)
 {
     IdfFormFields fields;
     size_t pos = 0;
@@ -763,7 +807,7 @@ static IdfFormFields parse_urlencoded(const std::string& body)
     return fields;
 }
 
-static const std::string* find_field(const IdfFormFields& fields, const char* key)
+const std::string* find_field(const IdfFormFields& fields, const char* key)
 {
     for (const auto& field : fields) {
         if (field.first == key) return &field.second;
@@ -771,23 +815,23 @@ static const std::string* find_field(const IdfFormFields& fields, const char* ke
     return nullptr;
 }
 
-static bool has_field(const IdfFormFields& fields, const char* key)
+bool has_field(const IdfFormFields& fields, const char* key)
 {
     return find_field(fields, key) != nullptr;
 }
 
-static std::string field_text(const IdfFormFields& fields, const char* key)
+std::string field_text(const IdfFormFields& fields, const char* key)
 {
     const std::string* value = find_field(fields, key);
     return value ? *value : std::string();
 }
 
-static void clear_sensitive_form_values(IdfFormFields& fields)
+void clear_sensitive_form_values(IdfFormFields& fields)
 {
     for (auto& field : fields) idf_lpa_clear_sensitive(field.second);
 }
 
-static size_t field_count(const IdfFormFields& fields, const char* key)
+size_t field_count(const IdfFormFields& fields, const char* key)
 {
     size_t count = 0;
     for (const auto& field : fields) {
@@ -796,7 +840,7 @@ static size_t field_count(const IdfFormFields& fields, const char* key)
     return count;
 }
 
-static bool field_blank(const std::string& value)
+bool field_blank(const std::string& value)
 {
     for (char ch : value) {
         if (!isspace(static_cast<unsigned char>(ch))) return false;
@@ -804,14 +848,14 @@ static bool field_blank(const std::string& value)
     return true;
 }
 
-static std::string redact_url_for_log(const std::string& url)
+std::string redact_url_for_log(const std::string& url)
 {
     size_t cut = url.find_first_of("?#");
     if (cut == std::string::npos) return url;
     return url.substr(0, cut) + "?...";
 }
 
-static bool parse_int_strict(const std::string& text, int& out)
+bool parse_int_strict(const std::string& text, int& out)
 {
     errno = 0;
     char* end = nullptr;
@@ -827,7 +871,7 @@ static bool parse_int_strict(const std::string& text, int& out)
     return true;
 }
 
-static bool parse_u32_strict(const char* raw, uint32_t& value, bool allow_zero)
+bool parse_u32_strict(const char* raw, uint32_t& value, bool allow_zero)
 {
     if (!raw || raw[0] == '\0') return false;
     uint32_t parsed = 0;
@@ -842,7 +886,7 @@ static bool parse_u32_strict(const char* raw, uint32_t& value, bool allow_zero)
     return true;
 }
 
-static int field_int(const IdfFormFields& fields, const char* key, int fallback)
+int field_int(const IdfFormFields& fields, const char* key, int fallback)
 {
     const std::string* value = find_field(fields, key);
     if (!value) return fallback;
@@ -850,14 +894,14 @@ static int field_int(const IdfFormFields& fields, const char* key, int fallback)
     return parse_int_strict(*value, parsed) ? parsed : fallback;
 }
 
-static uint8_t field_u8(const IdfFormFields& fields, const char* key, uint8_t fallback)
+uint8_t field_u8(const IdfFormFields& fields, const char* key, uint8_t fallback)
 {
     int parsed = field_int(fields, key, fallback);
     if (parsed < 0 || parsed > 255) return fallback;
     return static_cast<uint8_t>(parsed);
 }
 
-static bool get_query_param(httpd_req_t* req, const char* key, std::string& out, size_t max_query = 192)
+bool get_query_param(httpd_req_t* req, const char* key, std::string& out, size_t max_query = 192)
 {
     std::string query(max_query, '\0');
     if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) return false;
@@ -867,7 +911,7 @@ static bool get_query_param(httpd_req_t* req, const char* key, std::string& out,
     return true;
 }
 
-static std::string first_line_containing(const std::string& resp, const char* needle)
+std::string first_line_containing(const std::string& resp, const char* needle)
 {
     size_t p = resp.find(needle);
     if (p == std::string::npos) return {};
@@ -881,7 +925,7 @@ static std::string first_line_containing(const std::string& resp, const char* ne
     return line;
 }
 
-static bool parse_cfun_mode_line(const std::string& line, int& mode)
+bool parse_cfun_mode_line(const std::string& line, int& mode)
 {
     const char* p = strstr(line.c_str(), "+CFUN:");
     if (!p) return false;
@@ -892,7 +936,7 @@ static bool parse_cfun_mode_line(const std::string& line, int& mode)
     return true;
 }
 
-static bool parse_csq_line(const std::string& line, int& rssi, int& ber)
+bool parse_csq_line(const std::string& line, int& rssi, int& ber)
 {
     const char* p = strstr(line.c_str(), "+CSQ:");
     if (!p) return false;
@@ -910,7 +954,7 @@ static bool parse_csq_line(const std::string& line, int& rssi, int& ber)
     return true;
 }
 
-static esp_err_t handle_at(httpd_req_t* req)
+esp_err_t handle_at(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -933,11 +977,11 @@ static esp_err_t handle_at(httpd_req_t* req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid cmd");
         return ESP_OK;
     }
-    WebModemActionGuard modem_action;
+    WebModemActionGuard modem_action(*this);
     if (!modem_action.begin(req)) return ESP_OK;
 
     std::string resp;
-    esp_err_t err = idf_modem_send_at(cmd, 5000, resp);
+    esp_err_t err = idf_modem_send_at(sim_, cmd, 5000, resp);
     std::string body = "{\"success\":";
     body += (err == ESP_OK ? "true" : "false");
     body += ",";
@@ -947,7 +991,7 @@ static esp_err_t handle_at(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_flight(httpd_req_t* req)
+esp_err_t handle_flight(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -961,7 +1005,7 @@ static esp_err_t handle_flight(httpd_req_t* req)
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"飞行模式切换需要 POST\"}");
     }
 
-    WebModemActionGuard modem_action;
+    WebModemActionGuard modem_action(*this);
     if (!modem_action.begin(req)) return ESP_OK;
 
     std::string resp;
@@ -969,7 +1013,7 @@ static esp_err_t handle_flight(httpd_req_t* req)
     std::string message;
     int mode = -1;
 
-    if (idf_modem_send_at("AT+CFUN?", 3000, resp) == ESP_OK) {
+    if (idf_modem_send_at(sim_, "AT+CFUN?", 3000, resp) == ESP_OK) {
         std::string line = first_line_containing(resp, "+CFUN:");
         success = parse_cfun_mode_line(line, mode);
     }
@@ -988,7 +1032,7 @@ static esp_err_t handle_flight(httpd_req_t* req)
         char cmd[20];
         snprintf(cmd, sizeof(cmd), "AT+CFUN=%d", target);
         resp.clear();
-        esp_err_t err = idf_modem_send_at(cmd, 8000, resp);
+        esp_err_t err = idf_modem_send_at(sim_, cmd, 8000, resp);
         success = (err == ESP_OK);
         if (success) {
             mode = target;
@@ -1020,7 +1064,7 @@ static esp_err_t handle_flight(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_modem_control(httpd_req_t* req)
+esp_err_t handle_modem_control(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -1029,7 +1073,7 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     bool success = false;
     std::string message;
 
-    WebModemActionGuard modem_action;
+    WebModemActionGuard modem_action(*this);
     bool needs_modem = (action == "restart" || action == "hardreset" ||
                         action == "signal" || action == "operator" || action == "imei");
     if ((action == "restart" || action == "hardreset" || action == "sim-puk") && req->method != HTTP_POST) {
@@ -1039,13 +1083,13 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     if (needs_modem && !modem_action.begin(req)) return ESP_OK;
 
     if (action == "sim-puk") {
-        esp_err_t err = idf_modem_request_sim_unlock(true);
+        esp_err_t err = idf_modem_request_sim_unlock(sim_, true);
         success = err == ESP_OK;
         message = success ? "PUK 解锁请求已提交，请查看 SIM 状态" : esp_err_to_name(err);
         if (success) idf_log_line("网页已确认执行一次 SIM PUK 解锁");
     } else if (action == "restart" || action == "hardreset") {
         bool hard = action == "hardreset";
-        esp_err_t err = idf_modem_request_reset(hard);
+        esp_err_t err = idf_modem_request_reset(sim_, hard);
         success = (err == ESP_OK);
         if (success) idf_logf("网页触发模组%s重启", hard ? "硬" : "软");
         message = success
@@ -1053,7 +1097,7 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
             : esp_err_to_name(err);
     } else if (action == "signal") {
         std::string resp;
-        esp_err_t err = idf_modem_send_at("AT+CSQ", 3000, resp);
+        esp_err_t err = idf_modem_send_at(sim_, "AT+CSQ", 3000, resp);
         std::string line = first_line_containing(resp, "+CSQ:");
         int rssi = 99;
         int ber = 99;
@@ -1067,12 +1111,12 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
             message = resp.empty() ? esp_err_to_name(err) : resp;
         }
     } else if (action == "operator") {
-        esp_err_t err = idf_modem_get_operator(message);
+        esp_err_t err = idf_modem_get_operator(sim_, message);
         success = err == ESP_OK && !message.empty();
         if (!success) message = std::string("无法读取当前驻网运营商: ") + esp_err_to_name(err);
     } else if (action == "imei") {
         std::string imei;
-        esp_err_t err = idf_modem_get_imei(imei);
+        esp_err_t err = idf_modem_get_imei(sim_, imei);
         success = err == ESP_OK;
         message = success ? imei : std::string("无法读取模组 IMEI: ") + esp_err_to_name(err);
     } else {
@@ -1088,7 +1132,7 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_ussd(httpd_req_t* req)
+esp_err_t handle_ussd(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -1102,7 +1146,7 @@ static esp_err_t handle_ussd(httpd_req_t* req)
         set_json_no_cache(req);
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"USSD 码为空或包含非法字符\"}");
     }
-    WebModemActionGuard modem_action;
+    WebModemActionGuard modem_action(*this);
     if (!modem_action.begin(req)) return ESP_OK;
 
     idf_logf("网页发起 USSD 查询：%s", code.c_str());
@@ -1117,7 +1161,7 @@ static esp_err_t handle_ussd(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static bool plmn_valid(const std::string& plmn)
+bool plmn_valid(const std::string& plmn)
 {
     if (plmn.empty()) return true;
     if (plmn.size() < 5 || plmn.size() > 6) return false;
@@ -1127,13 +1171,14 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static bool apn_valid_for_at(const std::string& apn)
+bool apn_valid_for_at(const std::string& apn)
 {
     return apn.size() <= 96 && apn.find('"') == std::string::npos &&
            apn.find('\r') == std::string::npos && apn.find('\n') == std::string::npos;
 }
 
 struct ModemApplyTaskArg {
+    uint32_t generation = 0;
     bool dataChanged = false;
     bool operatorChanged = false;
     bool dataEnabled = false;
@@ -1142,9 +1187,10 @@ struct ModemApplyTaskArg {
     std::string operatorPlmn;
 };
 
-static void modem_apply_task(void* raw)
+void modem_apply_task(void* raw)
 {
     ModemApplyTaskArg* arg = static_cast<ModemApplyTaskArg*>(raw);
+    if (arg->generation != idf_modem_get_status(sim_).generation) { delete arg; vTaskDelete(nullptr); return; }
     bool data_changed = arg->dataChanged;
     bool operator_changed = arg->operatorChanged;
     bool data_enabled = arg->dataEnabled;
@@ -1178,7 +1224,7 @@ static void modem_apply_task(void* raw)
         vTaskDelete(nullptr);
     };
 
-    IdfModemStatus modem = idf_modem_get_status();
+    IdfModemStatus modem = idf_modem_get_status(sim_);
     if (!modem.modemReady) {
         idf_log_line("SIM 设置已保存，模组未注册，暂不下发 COPS/CGACT");
         finish();
@@ -1190,11 +1236,11 @@ static void modem_apply_task(void* raw)
         if (!plmn_valid(operator_plmn)) {
             idf_log_line("运营商 PLMN 非法，未下发 COPS");
         } else if (operator_plmn.empty()) {
-            idf_modem_send_at("AT+COPS=0", 30000, resp);
+            idf_modem_send_at(sim_, "AT+COPS=0", 30000, resp);
             idf_log_line("运营商: 自动注册(COPS=0)");
         } else {
             std::string cmd = "AT+COPS=1,2,\"" + operator_plmn + "\"";
-            esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
+            esp_err_t err = idf_modem_send_at(sim_, cmd, 30000, resp);
             idf_logf("运营商: 锁定 PLMN %s %s", operator_plmn.c_str(),
                      err == ESP_OK ? "成功" : "失败(可能不可达)");
         }
@@ -1203,28 +1249,28 @@ static void modem_apply_task(void* raw)
     if (data_changed) {
         if (data_enabled && !roaming_enabled && modem.ceregStat == 5) {
             // 数据漫游关闭且当前漫游：仅不激活数据 PDP；短信可用性由 SIM、模组与运营商网络共同决定
-            idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
+            idf_modem_send_at(sim_, "AT+CGACT=0,1", 5000, resp);
             idf_log_line("数据漫游已关闭：当前处于漫游，未激活蜂窝数据(不跑流量)");
         } else if (data_enabled) {
             if (!apn.empty() && apn_valid_for_at(apn)) {
                 std::string cmd = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
-                idf_modem_send_at(cmd, 3000, resp);
+                idf_modem_send_at(sim_, cmd, 3000, resp);
             } else if (!apn.empty()) {
                 idf_log_line("APN 包含非法字符，未下发 CGDCONT");
             }
-            idf_modem_send_at("AT+CGACT=1,1", 10000, resp);
+            idf_modem_send_at(sim_, "AT+CGACT=1,1", 10000, resp);
             std::string ip_resp;
-            idf_modem_send_at("AT+CGPADDR=1", 3000, ip_resp);
+            idf_modem_send_at(sim_, "AT+CGPADDR=1", 3000, ip_resp);
             idf_logf("蜂窝数据已启用(APN=%s)", apn.empty() ? "自动" : apn.c_str());
         } else {
-            idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
+            idf_modem_send_at(sim_, "AT+CGACT=0,1", 5000, resp);
             idf_log_line("蜂窝数据已禁用(零流量)");
         }
     }
     finish();
 }
 
-static void preserve_redacted_push_key(const IdfFormFields& fields,
+void preserve_redacted_push_key(const IdfFormFields& fields,
                                        const IdfPushChannel& previous,
                                        int index,
                                        int slot,
@@ -1246,7 +1292,7 @@ static void preserve_redacted_push_key(const IdfFormFields& fields,
     }
 }
 
-static void parse_push_channels_form(const IdfFormFields& fields,
+void parse_push_channels_form(const IdfFormFields& fields,
                                      const IdfPushChannel previous[IDF_MAX_PUSH_CHANNELS],
                                      IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS])
 {
@@ -1277,13 +1323,15 @@ static void parse_push_channels_form(const IdfFormFields& fields,
     }
 }
 
-static void parse_sched_tasks_form(const IdfFormFields& fields,
+void parse_sched_tasks_form(const IdfFormFields& fields,
                                    IdfSchedTask tasks[IDF_MAX_SCHED_TASKS])
 {
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
         char key[24];
         snprintf(key, sizeof(key), "st%dEn", i);
         tasks[i].enabled = has_field(fields, key);
+        snprintf(key, sizeof(key), "st%dSim", i);
+        tasks[i].sim = field_u8(fields, key, IDF_SIM1);
         snprintf(key, sizeof(key), "st%dName", i);
         tasks[i].name = field_text(fields, key);
         snprintf(key, sizeof(key), "st%dProf", i);
@@ -1318,7 +1366,7 @@ static void parse_sched_tasks_form(const IdfFormFields& fields,
     }
 }
 
-static void parse_sim_credentials_form(const IdfFormFields& fields,
+void parse_sim_credentials_form(const IdfFormFields& fields,
                                        IdfSimCredential items[IDF_MAX_SIM_CREDENTIALS])
 {
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
@@ -1333,7 +1381,7 @@ static void parse_sim_credentials_form(const IdfFormFields& fields,
     }
 }
 
-static esp_err_t handle_save(httpd_req_t* req)
+esp_err_t handle_save(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1434,7 +1482,7 @@ static esp_err_t handle_save(httpd_req_t* req)
 
     if (led_form) {
         bool enabled = has_field(fields, "netLedEnabled");
-        esp_err_t err = idf_config_set_net_led_enabled(enabled);
+        esp_err_t err = idf_config_set_net_led_enabled(sim_, enabled);
         if (err != ESP_OK) {
             return fail(err);
         }
@@ -1447,7 +1495,7 @@ static esp_err_t handle_save(httpd_req_t* req)
 
     if (call_form) {
         bool enabled = has_field(fields, "callNotifyEnabled");
-        esp_err_t err = idf_config_set_call_notify_enabled(enabled);
+        esp_err_t err = idf_config_set_call_notify_enabled(sim_, enabled);
         if (err != ESP_OK) return fail(err);
         httpd_resp_set_type(req, "text/plain");
         set_no_cache_headers(req);
@@ -1472,7 +1520,7 @@ static esp_err_t handle_save(httpd_req_t* req)
 
     if (push_form) {
         IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS];
-        IdfConfigWebView current = idf_config_get_web_view();
+        IdfConfigWebView current = idf_config_get_web_view(sim_);
         parse_push_channels_form(fields, current.pushChannels, channels);
         esp_err_t err = idf_config_save_push(has_field(fields, "pushEnabled"), channels);
         if (err != ESP_OK) return fail(err);
@@ -1482,7 +1530,7 @@ static esp_err_t handle_save(httpd_req_t* req)
     if (filter_form) {
         // 管理员号码与黑名单已拆成两个独立表单，各自只提交自己的字段：
         // 本次未提交的字段读当前值保留，避免只存其一时把另一个清空。
-        IdfConfigWebView cur = idf_config_get_web_view();
+        IdfConfigWebView cur = idf_config_get_web_view(sim_);
         std::string admin = has_field(fields, "adminPhone")
                                 ? field_text(fields, "adminPhone") : cur.adminPhone;
         std::string blacklist = has_field(fields, "numberBlackList")
@@ -1509,7 +1557,7 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (ka_form) {
-        esp_err_t err = idf_config_save_keepalive(has_field(fields, "kaEnabled"),
+        esp_err_t err = idf_config_save_keepalive(sim_, has_field(fields, "kaEnabled"),
                                                   field_int(fields, "kaIntervalDays", 175),
                                                   field_u8(fields, "kaAction", 1),
                                                   field_text(fields, "kaTarget"),
@@ -1547,10 +1595,10 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (sim_form) {
-        IdfSimSettingsView before = idf_config_get_sim_settings_view();
+        IdfSimSettingsView before = idf_config_get_sim_settings_view(sim_);
         IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
         parse_sim_credentials_form(fields, credentials);
-        esp_err_t err = idf_config_save_sim(has_field(fields, "dataEnabled"),
+        esp_err_t err = idf_config_save_sim(sim_, has_field(fields, "dataEnabled"),
                                             has_field(fields, "roamingEnabled"),
                                             field_text(fields, "apn"),
                                             field_text(fields, "operatorPlmn"),
@@ -1562,7 +1610,7 @@ static esp_err_t handle_save(httpd_req_t* req)
             return ESP_OK;
         }
         if (err != ESP_OK) return fail(err);
-        IdfSimSettingsView after = idf_config_get_sim_settings_view();
+        IdfSimSettingsView after = idf_config_get_sim_settings_view(sim_);
         bool data_changed = before.dataEnabled != after.dataEnabled || before.apn != after.apn ||
                             before.roamingEnabled != after.roamingEnabled;
         bool operator_changed = before.operatorPlmn != after.operatorPlmn;
@@ -1581,10 +1629,11 @@ static esp_err_t handle_save(httpd_req_t* req)
         set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_log_line("网页保存蜂窝设置");
-        if (credentials_changed) idf_modem_request_sim_unlock(false);
+        if (credentials_changed) idf_modem_request_sim_unlock(sim_, false);
         if (!data_changed && !operator_changed) return ESP_OK;
 
         ModemApplyTaskArg* arg = new (std::nothrow) ModemApplyTaskArg();
+    if (arg) arg->generation = idf_modem_get_status(sim_).generation;
         if (arg) {
             arg->dataChanged = data_changed;
             arg->operatorChanged = operator_changed;
@@ -1592,7 +1641,7 @@ static esp_err_t handle_save(httpd_req_t* req)
             arg->roamingEnabled = after.roamingEnabled;  // 不带上它，漫游关闭的立即生效保护永远不触发
             arg->apn = after.apn;
             arg->operatorPlmn = after.operatorPlmn;
-            if (xTaskCreate(modem_apply_task, "idf_sim_apply", 4096, arg, 3, nullptr) != pdPASS) {
+            if (create_task(&WebInstance::modem_apply_task, "idf_sim_apply", 4096, arg, 3, nullptr) != pdPASS) {
                 delete arg;
                 idf_log_line("SIM 设置已保存，但后台 AT 应用任务创建失败");
             }
@@ -1605,7 +1654,7 @@ static esp_err_t handle_save(httpd_req_t* req)
     return ESP_OK;
 }
 
-static esp_err_t handle_export_config(httpd_req_t* req)
+esp_err_t handle_export_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     std::string full;
@@ -1617,7 +1666,7 @@ static esp_err_t handle_export_config(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_import_config(httpd_req_t* req)
+esp_err_t handle_import_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1641,23 +1690,23 @@ static esp_err_t handle_import_config(httpd_req_t* req)
     return httpd_resp_send(req, resp.c_str(), resp.size());
 }
 
-static void restart_task(void*)
+void restart_task(void*)
 {
     vTaskDelay(pdMS_TO_TICKS(1200));
     // 计划内重启先给模组断电：保留"重启设备可救活已卡死模组"的原有语义，
     // 模组热启动快路径只留给崩溃/看门狗等意外复位
-    idf_modem_power_off_for_restart();
+    for (IdfModemId card = 1; card <= IDF_MODEM_COUNT; ++card) idf_modem_power_off_for_restart(card);
     esp_restart();
 }
 
-static void schedule_restart_or_now(const char* task_name)
+void schedule_restart_or_now(const char* task_name)
 {
-    if (xTaskCreate(restart_task, task_name, 3072, nullptr, 1, nullptr) == pdPASS) return;
+    if (create_task(&WebInstance::restart_task, task_name, 3072, nullptr, 1, nullptr) == pdPASS) return;
     idf_log_line("重启任务创建失败，改为当前任务直接重启");
     restart_task(nullptr);
 }
 
-static esp_err_t handle_factory_reset(httpd_req_t* req)
+esp_err_t handle_factory_reset(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1675,7 +1724,7 @@ static esp_err_t handle_factory_reset(httpd_req_t* req)
     return send_err;
 }
 
-static esp_err_t handle_wifi_config(httpd_req_t* req)
+esp_err_t handle_wifi_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1713,7 +1762,7 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
 }
 
 // 配网状态仅包含连接态、STA IP 和公开的 mDNS 名称，不返回 WiFi 凭据等敏感配置。
-static esp_err_t handle_apstatus(httpd_req_t* req)
+esp_err_t handle_apstatus(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;  // AP 模式经白名单免密；STA 模式仍需登录
     IdfWifiStatus wifi = idf_wifi_get_status();
@@ -1732,7 +1781,7 @@ static esp_err_t handle_apstatus(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_wifi(httpd_req_t* req)
+esp_err_t handle_wifi(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -1762,7 +1811,7 @@ static esp_err_t handle_wifi(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_wifi_scan(httpd_req_t* req)
+esp_err_t handle_wifi_scan(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     set_json_no_cache(req);
@@ -1775,7 +1824,7 @@ static esp_err_t handle_wifi_scan(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static bool parse_multipart_boundary(const char* content_type, std::string& marker)
+bool parse_multipart_boundary(const char* content_type, std::string& marker)
 {
     const char* p = strstr(content_type, "boundary=");
     if (!p) return false;
@@ -1791,7 +1840,7 @@ static bool parse_multipart_boundary(const char* content_type, std::string& mark
     return true;
 }
 
-static bool is_hex_sha256(const std::string& value)
+bool is_hex_sha256(const std::string& value)
 {
     if (value.size() != 64) return false;
     for (char ch : value) {
@@ -1800,7 +1849,7 @@ static bool is_hex_sha256(const std::string& value)
     return true;
 }
 
-static std::string hex_lower(const unsigned char* data, size_t len)
+std::string hex_lower(const unsigned char* data, size_t len)
 {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -1812,7 +1861,7 @@ static std::string hex_lower(const unsigned char* data, size_t len)
     return out;
 }
 
-static esp_err_t handle_ota_update(httpd_req_t* req)
+esp_err_t handle_ota_update(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1969,6 +2018,12 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     if (sha_active) mbedtls_md_free(&sha_ctx);
     if (err == ESP_OK) err = esp_ota_end(ota);
     else esp_ota_abort(ota);
+    // 双模组镜像专用标识：普通上游镜像绝不能成为下次启动镜像。
+    if (err == ESP_OK) {
+        esp_app_desc_t candidate = {};
+        err = esp_ota_get_partition_description(part, &candidate);
+        if (err == ESP_OK && !idf_dual_firmware_identity_valid(candidate.project_name, candidate.version)) err = ESP_ERR_INVALID_VERSION;
+    }
     if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
 
     set_json_no_cache(req);
@@ -1988,7 +2043,7 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     return send_err;
 }
 
-static esp_err_t handle_send_sms(httpd_req_t* req)
+esp_err_t handle_send_sms(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -1996,7 +2051,7 @@ static esp_err_t handle_send_sms(httpd_req_t* req)
     if (read_body(req, raw, 2048) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(raw);
     std::string msg;
-    esp_err_t err = idf_sms_enqueue_outgoing(field_text(fields, "phone"),
+    esp_err_t err = idf_sms_enqueue_outgoing(sim_, field_text(fields, "phone"),
                                              field_text(fields, "content"),
                                              msg);
     std::string body = "{\"success\":";
@@ -2010,7 +2065,7 @@ static esp_err_t handle_send_sms(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_messages(httpd_req_t* req)
+esp_err_t handle_messages(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     char query[96] = {};
@@ -2029,11 +2084,13 @@ static esp_err_t handle_messages(httpd_req_t* req)
         }
     }
     set_json_no_cache(req);
-    std::string body = idf_inbox_json(sent_box, limit);
+    char scope[12] = {};
+    bool all = httpd_query_key_value(query, "scope", scope, sizeof(scope)) == ESP_OK && strcmp(scope, "all") == 0;
+    std::string body = idf_inbox_json(sent_box, limit, all ? 0 : sim_);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_empty_log(httpd_req_t* req)
+esp_err_t handle_empty_log(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     set_json_no_cache(req);
@@ -2048,7 +2105,7 @@ static esp_err_t handle_empty_log(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_log_download(httpd_req_t* req)
+esp_err_t handle_log_download(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -2058,7 +2115,7 @@ static esp_err_t handle_log_download(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_prev_log(httpd_req_t* req)
+esp_err_t handle_prev_log(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -2080,7 +2137,7 @@ static esp_err_t handle_prev_log(httpd_req_t* req)
 
 // 下载崩溃转储原始镜像，可在电脑上用
 // espcoredump.py info_corefile --core coredump.bin --core-format raw 解析完整回溯
-static esp_err_t handle_coredump_download(httpd_req_t* req)
+esp_err_t handle_coredump_download(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     size_t addr = 0;
@@ -2119,7 +2176,7 @@ static esp_err_t handle_coredump_download(httpd_req_t* req)
     return httpd_resp_send_chunk(req, nullptr, 0);
 }
 
-static esp_err_t handle_coredump_clear(httpd_req_t* req)
+esp_err_t handle_coredump_clear(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -2134,7 +2191,7 @@ static esp_err_t handle_coredump_clear(httpd_req_t* req)
     return httpd_resp_send(req, body, strlen(body));
 }
 
-static bool query_u32(httpd_req_t* req, const char* key, uint32_t& value)
+bool query_u32(httpd_req_t* req, const char* key, uint32_t& value)
 {
     char query[96] = {};
     char raw[24] = {};
@@ -2145,19 +2202,20 @@ static bool query_u32(httpd_req_t* req, const char* key, uint32_t& value)
     return parse_u32_strict(raw, value, false);
 }
 
-static esp_err_t handle_delete_message(httpd_req_t* req)
+esp_err_t handle_delete_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
-    bool ok = query_u32(req, "id", id) && idf_inbox_delete(id);
+    IdfInboxEntry entry;
+    bool ok = query_u32(req, "id", id) && idf_inbox_get_by_id(id, entry) && entry.sim == sim_ && idf_inbox_delete(id);
     set_json_no_cache(req);
     return httpd_resp_sendstr(req, ok
         ? "{\"success\":true,\"message\":\"已删除\"}"
         : "{\"success\":false,\"message\":\"未找到\"}");
 }
 
-static esp_err_t handle_resend_message(httpd_req_t* req)
+esp_err_t handle_resend_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -2165,17 +2223,17 @@ static esp_err_t handle_resend_message(httpd_req_t* req)
     IdfInboxEntry entry;
     bool found = query_u32(req, "id", id) && idf_inbox_get_by_id(id, entry);
     set_json_no_cache(req);
-    if (!found) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未找到该短信\"}");
+    if (!found || entry.sim != sim_) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未找到该卡短信\"}");
     }
-    bool ok = idf_push_enqueue_forward(entry.sender.c_str(), entry.text.c_str(), entry.ts.c_str(), entry.id);
+    bool ok = idf_push_enqueue_forward(entry.sim, entry.sender.c_str(), entry.text.c_str(), entry.ts.c_str(), entry.id);
     idf_logf("网页手动重发短信 id=%u: %s", static_cast<unsigned>(id), ok ? "已入队" : "入队失败");
     return httpd_resp_sendstr(req, ok
         ? "{\"success\":true,\"message\":\"已重新入队转发\"}"
         : "{\"success\":false,\"message\":\"转发队列繁忙，请稍后重试\"}");
 }
 
-static esp_err_t handle_test_push(httpd_req_t* req)
+esp_err_t handle_test_push(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -2210,7 +2268,7 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_test_rule(httpd_req_t* req)
+esp_err_t handle_test_rule(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -2237,7 +2295,7 @@ static esp_err_t handle_test_rule(httpd_req_t* req)
         return httpd_resp_send(req, body.data(), body.size());
     }
 
-    IdfForwardRuleDecision decision = idf_push_eval_forward_rules(rules, sender, text);
+    IdfForwardRuleDecision decision = idf_push_eval_forward_rules(sim_, rules, sender, text);
     char body[192];
     snprintf(body, sizeof(body),
              "{\"success\":true,\"matched\":%s,\"drop\":%s,\"email\":%s,\"chMask\":%u,\"ruleIndex\":%d}",
@@ -2248,7 +2306,7 @@ static esp_err_t handle_test_rule(httpd_req_t* req)
     return httpd_resp_sendstr(req, body);
 }
 
-static bool keepalive_url_valid(const std::string& raw_url, std::string& err)
+bool keepalive_url_valid(const std::string& raw_url, std::string& err)
 {
     std::string url = idf_util_trim_copy(raw_url);
     if (url.size() > 240) {
@@ -2266,17 +2324,17 @@ static bool keepalive_url_valid(const std::string& raw_url, std::string& err)
     return true;
 }
 
-static bool cell_job_lock(TickType_t ticks)
+bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300))
 {
     return s_cell_job_mutex && xSemaphoreTake(s_cell_job_mutex, ticks) == pdTRUE;
 }
 
-static void cell_job_unlock(void)
+void cell_job_unlock(void)
 {
     xSemaphoreGive(s_cell_job_mutex);
 }
 
-static bool cellular_job_active_locked(void)
+bool cellular_job_active_locked(void)
 {
     return s_ping_job.running || s_ping_job.queued ||
            s_keepalive_job.running || s_keepalive_job.queued ||
@@ -2286,7 +2344,7 @@ static bool cellular_job_active_locked(void)
            s_web_modem_action_running;
 }
 
-static std::string cellular_http_message(const IdfCellularHttpResult& result)
+std::string cellular_http_message(const IdfCellularHttpResult& result)
 {
     char buf[192];
     if (result.ok) {
@@ -2303,7 +2361,7 @@ static std::string cellular_http_message(const IdfCellularHttpResult& result)
     return std::string(buf);
 }
 
-static IdfCellularHttpConfig cellular_http_config(bool data_enabled, const std::string& apn)
+IdfCellularHttpConfig cellular_http_config(bool data_enabled, const std::string& apn)
 {
     IdfCellularHttpConfig cfg;
     cfg.dataEnabled = data_enabled;
@@ -2312,11 +2370,13 @@ static IdfCellularHttpConfig cellular_http_config(bool data_enabled, const std::
 }
 
 struct PingTaskArg {
+    uint32_t generation = 0;
     std::string url;
     IdfCellularHttpConfig cellular;
 };
 
 struct EsimTaskArg {
+    uint32_t generation = 0;
     std::string action;
     std::string identifier;
     std::string nickname;
@@ -2324,7 +2384,7 @@ struct EsimTaskArg {
     LpaActivationCode activationCode;
 };
 
-static void lpa_job_set_phase(void*, const char* phase, const char* phase_message)
+void lpa_job_set_phase(void*, const char* phase, const char* phase_message)
 {
     if (!cell_job_lock()) return;
     s_esim_job.installPhase = phase ? phase : "";
@@ -2332,7 +2392,7 @@ static void lpa_job_set_phase(void*, const char* phase, const char* phase_messag
     cell_job_unlock();
 }
 
-static esp_err_t lpa_job_wait_confirmation(void*, std::string& code, std::string& message)
+esp_err_t lpa_job_wait_confirmation(void*, std::string& code, std::string& message)
 {
     code.clear();
     for (int i = 0; i < 600; ++i) {
@@ -2352,7 +2412,7 @@ static esp_err_t lpa_job_wait_confirmation(void*, std::string& code, std::string
     return ESP_ERR_TIMEOUT;
 }
 
-static std::string esim_action_label(const std::string& action)
+std::string esim_action_label(const std::string& action)
 {
     if (action == "refresh") return "刷新 eSIM Profile";
     if (action == "install-start") return "下载 eSIM Profile";
@@ -2365,13 +2425,14 @@ static std::string esim_action_label(const std::string& action)
     return "eSIM 操作";
 }
 
-static bool copy_esim_state(WebAsyncJob& job,
+bool copy_esim_state(WebAsyncJob& job,
                             std::string& eid,
                             std::vector<IdfEsimProfile>& profiles,
                             uint32_t& updated_at)
 {
     if (!cell_job_lock()) return false;
     job = s_esim_job;
+    if (s_esim_cache.generation != idf_modem_get_status(sim_).generation) s_esim_cache = EsimWebCache{};
     eid = s_esim_cache.eid;
     profiles = s_esim_cache.profiles;
     updated_at = s_esim_cache.updatedAt;
@@ -2379,7 +2440,7 @@ static bool copy_esim_state(WebAsyncJob& job,
     return true;
 }
 
-static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
+void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
 {
     body += "{";
     json_prop(body, "iccid", p.iccid); body += ",";
@@ -2392,9 +2453,13 @@ static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
     body += "}";
 }
 
-static void esim_task(void* arg_raw)
+void esim_task(void* arg_raw)
 {
     EsimTaskArg* arg = static_cast<EsimTaskArg*>(arg_raw);
+    if (arg->generation != idf_modem_get_status(sim_).generation) {
+        if (cell_job_lock(portMAX_DELAY)) { s_esim_job.queued = false; s_esim_job.running = false; s_esim_job.done = true; s_esim_job.success = false; s_esim_job.message = "卡身份已改变，旧任务取消"; cell_job_unlock(); }
+        delete arg; vTaskDelete(nullptr); return;
+    }
     std::string action = std::move(arg->action);
     std::string identifier = std::move(arg->identifier);
     std::string nickname = std::move(arg->nickname);
@@ -2422,10 +2487,11 @@ static void esim_task(void* arg_raw)
     if (action == "install-start") {
         LpaDownloadObserver observer;
         observer.allow_missing_admin_protocol = allow_missing_admin_protocol;
-        observer.set_phase = lpa_job_set_phase;
-        observer.wait_confirmation_code = lpa_job_wait_confirmation;
+        observer.context = this;
+        observer.set_phase = [](void* ctx, const char* phase, const char* msg) { static_cast<WebInstance*>(ctx)->lpa_job_set_phase(ctx, phase, msg); };
+        observer.wait_confirmation_code = [](void* ctx, std::string& code, std::string& msg) { return static_cast<WebInstance*>(ctx)->lpa_job_wait_confirmation(ctx, code, msg); };
         LpaDownloadStats stats;
-        err = idf_lpa_run_profile_download(activation_code, observer, stats, message);
+        err = idf_lpa_run_profile_download(sim_, activation_code, observer, stats, message);
         // 仅输出资源计数，便于真机比较不同 BPP；不包含任何下载凭据或协议载荷。
         idf_logf("eSIM下载资源汇总: result=%s bppEncodedBytes=%u bppDecodedBytes=%u "
                  "freeHeapAtStart=%u minimumFreeHeap=%u largestFreeBlock=%u freeHeapAtEnd=%u",
@@ -2438,7 +2504,7 @@ static void esim_task(void* arg_raw)
                  static_cast<unsigned>(stats.freeHeapAtEnd));
         if (err == ESP_OK) {
             std::string refresh_message;
-            err = idf_esim_list_profiles(profiles, eid, refresh_message);
+            err = idf_esim_list_profiles(sim_, profiles, eid, refresh_message);
             if (err != ESP_OK) {
                 message = "Profile 已写入，但刷新列表失败：" + refresh_message;
             } else {
@@ -2446,20 +2512,20 @@ static void esim_task(void* arg_raw)
             }
         }
     } else if (action == "refresh") {
-        err = idf_esim_list_profiles(profiles, eid, message);
+        err = idf_esim_list_profiles(sim_, profiles, eid, message);
     } else if (action == "info") {
-        err = idf_esim_get_eid(eid, message);
+        err = idf_esim_get_eid(sim_, eid, message);
         cache_eid_only = (err == ESP_OK);
     } else if (action == "enable") {
-        err = idf_esim_enable_profile(identifier, message);
+        err = idf_esim_enable_profile(sim_, identifier, message);
     } else if (action == "disable") {
-        err = idf_esim_disable_profile(identifier, message);
+        err = idf_esim_disable_profile(sim_, identifier, message);
     } else if (action == "delete") {
-        err = idf_esim_delete_profile(identifier, message);
+        err = idf_esim_delete_profile(sim_, identifier, message);
     } else if (action == "nickname") {
-        err = idf_esim_set_nickname(identifier, nickname, message);
+        err = idf_esim_set_nickname(sim_, identifier, nickname, message);
     } else if (action == "switch") {
-        err = idf_esim_switch_profile(identifier, message);
+        err = idf_esim_switch_profile(sim_, identifier, message);
     } else {
         message = "未知 eSIM 操作";
     }
@@ -2469,14 +2535,14 @@ static void esim_task(void* arg_raw)
     // 启用/切换/禁用改变当前生效的卡：让模组重读号码/ICCID/运营商，避免概览沿用旧卡缓存
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
     if (sim_changed) {
-        idf_modem_invalidate_sim_identity();
+        idf_modem_invalidate_sim_identity(sim_);
     }
     if (ok && (action == "delete" || action == "nickname")) {
         // 不影响当前 UICC 会话的操作：立即回读一次列表刷新缓存
         std::string refresh_msg;
         std::vector<IdfEsimProfile> refreshed;
         std::string refreshed_eid;
-        if (idf_esim_list_profiles(refreshed, refreshed_eid, refresh_msg) == ESP_OK) {
+        if (idf_esim_list_profiles(sim_, refreshed, refreshed_eid, refresh_msg) == ESP_OK) {
             profiles = std::move(refreshed);
             eid = std::move(refreshed_eid);
             cache_ready = true;
@@ -2494,6 +2560,7 @@ static void esim_task(void* arg_raw)
         : message;
     activation_code.clear_sensitive();
     if (cell_job_lock(portMAX_DELAY)) {
+        s_esim_cache.generation = idf_modem_get_status(sim_).generation;
         bool eid_changed = !eid.empty() && !s_esim_cache.eid.empty() && eid != s_esim_cache.eid;
         if (cache_eid_only) {
             if (eid_changed) s_esim_cache.profiles.clear();
@@ -2525,7 +2592,7 @@ static void esim_task(void* arg_raw)
     vTaskDelete(nullptr);
 }
 
-static bool start_esim_job(const std::string& action,
+bool start_esim_job(const std::string& action,
                            const std::string& identifier,
                            const std::string& nickname,
                            std::string& message,
@@ -2562,6 +2629,7 @@ static bool start_esim_job(const std::string& action,
     cell_job_unlock();
 
     EsimTaskArg* arg = new (std::nothrow) EsimTaskArg();
+    if (arg) arg->generation = idf_modem_get_status(sim_).generation;
     if (!arg) {
         if (cell_job_lock(portMAX_DELAY)) {
             idf_lpa_clear_sensitive(s_esim_confirmation_code);
@@ -2582,7 +2650,7 @@ static bool start_esim_job(const std::string& action,
     arg->nickname = nickname;
     arg->allowMissingAdminProtocol = allow_missing_admin_protocol;
     arg->activationCode = std::move(activation_code);
-    if (xTaskCreate(esim_task, "idf_esim", 8192, arg, 3, nullptr) != pdPASS) {
+    if (create_task(&WebInstance::esim_task, "idf_esim", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             idf_lpa_clear_sensitive(s_esim_confirmation_code);
@@ -2605,9 +2673,13 @@ static bool start_esim_job(const std::string& action,
     return true;
 }
 
-static void ping_task(void* arg_raw)
+void ping_task(void* arg_raw)
 {
     PingTaskArg* arg = static_cast<PingTaskArg*>(arg_raw);
+    if (arg->generation != idf_modem_get_status(sim_).generation) {
+        if (cell_job_lock(portMAX_DELAY)) { s_ping_job.queued = false; s_ping_job.running = false; s_ping_job.done = true; s_ping_job.success = false; s_ping_job.message = "卡身份已改变，旧任务取消"; cell_job_unlock(); }
+        delete arg; vTaskDelete(nullptr); return;
+    }
     if (cell_job_lock()) {
         s_ping_job.queued = false;
         s_ping_job.running = true;
@@ -2616,7 +2688,7 @@ static void ping_task(void* arg_raw)
     }
 
     IdfCellularHttpResult result;
-    esp_err_t err = idf_modem_cellular_http_get(arg->url, arg->cellular, result);
+    esp_err_t err = idf_modem_cellular_http_get(sim_, arg->url, arg->cellular, result);
     bool ok = (err == ESP_OK && result.ok);
     std::string message = cellular_http_message(result);
 
@@ -2633,7 +2705,7 @@ static void ping_task(void* arg_raw)
     vTaskDelete(nullptr);
 }
 
-static bool valid_ussd_code(const std::string& code)
+bool valid_ussd_code(const std::string& code)
 {
     if (code.empty() || code.size() > 24) return false;
     for (char ch : code) {
@@ -2643,38 +2715,40 @@ static bool valid_ussd_code(const std::string& code)
 }
 
 // 网页/保号/定时任务三处共用的 USSD 发送：resp_out 为 +CUSD 上报原文，无上报时为错误名
-static bool run_ussd(const std::string& code, std::string& resp_out)
+bool run_ussd(const std::string& code, std::string& resp_out)
 {
     std::string cmd = "AT+CUSD=1,\"" + code + "\",15";
     std::string resp;
-    esp_err_t err = idf_modem_send_at_until(cmd, "+CUSD:", 20000, resp);
+    esp_err_t err = idf_modem_send_at_until(sim_, cmd, "+CUSD:", 20000, resp);
     resp_out = resp.empty() ? std::string(esp_err_to_name(err)) : resp;
     return err == ESP_OK && resp.find("+CUSD:") != std::string::npos;
 }
 
 struct KeepAliveTaskArg {
+    uint32_t generation = 0;
     IdfKeepaliveRunView config;
 };
 
-static std::string keepalive_profile_note(const IdfKeepaliveRunView& cfg)
+std::string keepalive_profile_note(const IdfKeepaliveRunView& cfg)
 {
     if (cfg.kaProfile.empty()) return std::string();
     return std::string("目标 eSIM: ") + idf_esim_mask_profile_id(cfg.kaProfile);
 }
 
-static bool enqueue_maintenance_notice(int tz_offset_min, bool email_enabled, const char* title,
+bool enqueue_maintenance_notice(int tz_offset_min, bool email_enabled, const char* title,
                                       const std::string& body, uint32_t now)
 {
     std::string ts = format_epoch_local(now, tz_offset_min);
-    int pushed = idf_push_enqueue_notify(title, body.c_str(), ts.c_str());
+    std::string scoped_title = "[SIM" + std::to_string(sim_) + "] " + title;
+    int pushed = idf_push_enqueue_notify(scoped_title.c_str(), body.c_str(), ts.c_str());
     if (pushed > 0) idf_logf("%s推送已入队: %d 个通道", title, pushed);
     else idf_logf("%s推送未入队：无有效通道或队列暂满", title);
 
-    bool emailed = email_enabled && idf_push_enqueue_email(title, body.c_str());
+    bool emailed = email_enabled && idf_push_enqueue_email(scoped_title.c_str(), body.c_str());
     return pushed > 0 || emailed;
 }
 
-static void keepalive_set_job_message(const std::string& message)
+void keepalive_set_job_message(const std::string& message)
 {
     if (cell_job_lock()) {
         s_keepalive_job.message = message;
@@ -2682,20 +2756,20 @@ static void keepalive_set_job_message(const std::string& message)
     }
 }
 
-static bool wait_registered_for(uint32_t timeout_ms)
+bool wait_registered_for(uint32_t timeout_ms)
 {
     // 只看模组任务维护的注册状态，不自己发 CEREG：切卡后模组正在软重启，抢 AT 通道
     // 只会拖慢重启；且重启请求受理时 modemReady 已同步清零，不会把旧 Profile 的
     // 注册状态误判成切换完成(issue #17)
     uint64_t deadline = esp_timer_get_time() + static_cast<uint64_t>(timeout_ms) * 1000ULL;
     while (esp_timer_get_time() < deadline) {
-        if (idf_modem_get_status().modemReady) return true;
+        if (idf_modem_get_status(sim_).modemReady) return true;
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
     return false;
 }
 
-static bool wait_registered_after_esim_switch(std::string& message)
+bool wait_registered_after_esim_switch(std::string& message)
 {
     // 切卡成功时 idf_esim 已请求模组软重启，这里等待重启后在新 Profile 上重新注册
     if (wait_registered_for(90000)) {
@@ -2704,7 +2778,7 @@ static bool wait_registered_after_esim_switch(std::string& message)
     }
     // 超时兜底：再重启一次模组重新附着
     idf_logf("eSIM 切换后 90s 未注册，重启模组重新附着");
-    if (idf_modem_request_reset(false) == ESP_OK && wait_registered_for(90000)) {
+    if (idf_modem_request_reset(sim_, false) == ESP_OK && wait_registered_for(90000)) {
         message = "eSIM 切换后经模组重启已注册";
         return true;
     }
@@ -2720,7 +2794,7 @@ struct EsimJobSwitch {
 
 // profile 非空时切换到目标 Profile 并等待网络注册；用同一份列表同时确定
 // "当前启用的卡"与"目标卡"，避免两次读卡。目标已启用则不动作。
-static bool esim_prepare_profile(const std::string& profile,
+bool esim_prepare_profile(const std::string& profile,
                                  EsimJobSwitch& sw,
                                  std::string& message)
 {
@@ -2730,7 +2804,7 @@ static bool esim_prepare_profile(const std::string& profile,
     std::vector<IdfEsimProfile> profiles;
     std::string eid;
     std::string list_msg;
-    if (idf_esim_list_profiles(profiles, eid, list_msg) != ESP_OK) {
+    if (idf_esim_list_profiles(sim_, profiles, eid, list_msg) != ESP_OK) {
         message = "读取 eSIM Profile 列表失败: " + list_msg;
         return false;
     }
@@ -2759,7 +2833,7 @@ static bool esim_prepare_profile(const std::string& profile,
 
     idf_logf("任务准备切换 eSIM: %s", idf_esim_mask_profile_id(enable_id).c_str());
     std::string switch_msg;
-    if (idf_esim_enable_profile(enable_id, switch_msg) != ESP_OK) {
+    if (idf_esim_enable_profile(sim_, enable_id, switch_msg) != ESP_OK) {
         message = (target ? "eSIM 切换失败: " : "未找到目标 Profile 且直接启用失败: ") + switch_msg;
         return false;
     }
@@ -2774,7 +2848,7 @@ static bool esim_prepare_profile(const std::string& profile,
     return true;
 }
 
-static void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
+void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
 {
     if (!sw.switched) return;
     if (sw.original.empty()) {
@@ -2784,7 +2858,7 @@ static void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
     std::string masked = idf_esim_mask_profile_id(sw.original);
     idf_logf("任务完成，切回原 eSIM: %s", masked.c_str());
     std::string msg;
-    if (idf_esim_enable_profile(sw.original, msg) != ESP_OK) {
+    if (idf_esim_enable_profile(sim_, sw.original, msg) != ESP_OK) {
         message = "切回原 Profile 失败: " + msg;
         return;
     }
@@ -2793,16 +2867,17 @@ static void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
     message = "已切回原 Profile " + masked + "；" + wait_msg;
 }
 
-static bool keepalive_prepare_esim(const IdfKeepaliveRunView& cfg, EsimJobSwitch& sw, std::string& message)
+bool keepalive_prepare_esim(const IdfKeepaliveRunView& cfg, EsimJobSwitch& sw, std::string& message)
 {
     if (cfg.kaProfile.empty()) return true;
     keepalive_set_job_message("保号动作执行中，正在切换 eSIM: " + idf_esim_mask_profile_id(cfg.kaProfile));
     return esim_prepare_profile(cfg.kaProfile, sw, message);
 }
 
-static void keepalive_task(void* arg_raw)
+void keepalive_task(void* arg_raw)
 {
     KeepAliveTaskArg* arg = static_cast<KeepAliveTaskArg*>(arg_raw);
+    bool same_card = arg->generation == idf_modem_get_status(sim_).generation;
     IdfKeepaliveRunView cfg = std::move(arg->config);
     delete arg;
 
@@ -2819,7 +2894,11 @@ static void keepalive_task(void* arg_raw)
     std::string profile_note = keepalive_profile_note(cfg);
     if (!profile_note.empty()) idf_logf("保号任务%s", profile_note.c_str());
     EsimJobSwitch esim_switch;
-    bool esim_ready = keepalive_prepare_esim(cfg, esim_switch, message);
+    const uint32_t attempt_time = static_cast<uint32_t>(time(nullptr));
+    bool attempt_saved = same_card && epoch_valid(attempt_time) &&
+        idf_config_set_keepalive_last(sim_, attempt_time) == ESP_OK;
+    bool esim_ready = attempt_saved && keepalive_prepare_esim(cfg, esim_switch, message);
+    if (!attempt_saved) message = "卡身份已变更、时间未同步或执行标记保存失败；未执行计费动作";
     if (!esim_ready) {
         ok = false;
     } else if (cfg.kaAction == 2) {
@@ -2828,7 +2907,7 @@ static void keepalive_task(void* arg_raw)
         } else {
             std::string prefix = message;
             std::string sms_msg;
-            esp_err_t err = idf_sms_send_text(cfg.kaTarget, "keepalive", sms_msg);
+            esp_err_t err = idf_sms_send_text(sim_, cfg.kaTarget, "keepalive", sms_msg);
             ok = (err == ESP_OK);
             message = prefix.empty() ? sms_msg : (prefix + "；" + sms_msg);
         }
@@ -2844,7 +2923,7 @@ static void keepalive_task(void* arg_raw)
     } else {
         IdfCellularHttpResult result;
         std::string url = cfg.kaUrl.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : cfg.kaUrl;
-        esp_err_t err = idf_modem_cellular_http_get(url, cellular_http_config(cfg.dataEnabled, cfg.apn), result);
+        esp_err_t err = idf_modem_cellular_http_get(sim_, url, cellular_http_config(cfg.dataEnabled, cfg.apn), result);
         ok = (err == ESP_OK && result.ok);
         message = message.empty() ? cellular_http_message(result) : (message + "；" + cellular_http_message(result));
     }
@@ -2862,7 +2941,7 @@ static void keepalive_task(void* arg_raw)
 
     if (ok) {
         uint32_t now = static_cast<uint32_t>(time(nullptr));
-        if (now >= 1700000000u && idf_config_set_keepalive_last(now) == ESP_OK) {
+        if (now >= 1700000000u && idf_config_set_keepalive_last(sim_, now) == ESP_OK) {
             message += "，已更新保号基准日";
         }
         idf_log_line("保号动作成功");
@@ -2872,16 +2951,7 @@ static void keepalive_task(void* arg_raw)
         enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled, "保号动作已执行", notice, now);
     } else {
         idf_logf("保号动作失败: %s", message.c_str());
-        // 带切卡的保号失败改为次日重试：每小时重试意味着反复切卡+模组重启，
-        // 主卡每小时掉线数分钟，比错过一次保号代价更大（普通保号仍每小时重试）
-        uint32_t now = static_cast<uint32_t>(time(nullptr));
-        if (!cfg.kaProfile.empty() && epoch_valid(now) && cfg.kaIntervalDays > 0) {
-            uint64_t back = static_cast<uint64_t>(cfg.kaIntervalDays - 1) * 86400ULL;
-            uint32_t base = back < now ? now - static_cast<uint32_t>(back) : now;
-            if (idf_config_set_keepalive_last(base) == ESP_OK) {
-                idf_log_line("保号失败已退避，次日重试");
-            }
-        }
+        message += "；本次不自动重试，请核对运营商结果后手动操作";
     }
 
     // 终态必须写进去：这里拿不到锁就放弃的话，任务状态永远停在 running，
@@ -2898,7 +2968,7 @@ static void keepalive_task(void* arg_raw)
     vTaskDelete(nullptr);
 }
 
-static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queued_message,
+bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queued_message,
                                 std::string& message, bool& already_running)
 {
     already_running = false;
@@ -2923,6 +2993,7 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
     cell_job_unlock();
 
     KeepAliveTaskArg* arg = new (std::nothrow) KeepAliveTaskArg();
+    if (arg) arg->generation = idf_modem_get_status(sim_).generation;
     if (!arg) {
         if (cell_job_lock(portMAX_DELAY)) {
             s_keepalive_job.queued = false;
@@ -2936,7 +3007,7 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
     }
     arg->config = cfg;
     // 8192：kaProfile 路径会走完整 eSIM 列表/切换/TLV 解析链，6144 余量不足
-    if (xTaskCreate(keepalive_task, "idf_keepalive", 8192, arg, 3, nullptr) != pdPASS) {
+    if (create_task(&WebInstance::keepalive_task, "idf_keepalive", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_keepalive_job.queued = false;
@@ -2953,7 +3024,7 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
     return true;
 }
 
-static bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days)
+bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days)
 {
     if (!epoch_valid(now) || interval_days == 0) return false;
     if (!epoch_valid(last_ts)) return true;
@@ -2961,17 +3032,17 @@ static bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days
     return (now - last_ts) >= interval_days * 86400u;
 }
 
-static bool system_idle_for_maintenance()
+bool system_idle_for_maintenance()
 {
     return !idf_push_busy() &&
            idf_push_forward_queue_depth() == 0 &&
            idf_push_retry_queue_depth() == 0 &&
-           idf_sms_outgoing_queue_depth() == 0 &&
+           idf_sms_outgoing_queue_depth(1) == 0 && idf_sms_outgoing_queue_depth(2) == 0 &&
            idf_push_email_queue_depth() == 0 &&
-           !cellular_job_active();
+           !instance(1).cellular_job_active() && !instance(2).cellular_job_active();
 }
 
-static bool cellular_job_active()
+bool cellular_job_active()
 {
     // 拿不到锁按"忙"处理(fail-safe)：该函数用于维护性重启前的空闲判断，
     // 误判空闲会在 eSIM 切换/保号中途 esp_restart，设备可能停在错误的卡上
@@ -2986,11 +3057,12 @@ static bool cellular_job_active()
 // ========== 进阶定时任务：选卡→执行→切回 ==========
 
 struct SchedTaskArg {
+    uint32_t generation = 0;
     IdfSchedRunView config;
     int index = 0;
 };
 
-static const char* sched_action_name(uint8_t action)
+const char* sched_action_name(uint8_t action)
 {
     switch (action) {
         case 0: return "推送提醒";
@@ -3001,7 +3073,7 @@ static const char* sched_action_name(uint8_t action)
     }
 }
 
-static std::string sched_task_label(const IdfSchedTask& t, int index)
+std::string sched_task_label(const IdfSchedTask& t, int index)
 {
     if (!t.name.empty()) return t.name;
     char buf[32];
@@ -3009,7 +3081,7 @@ static std::string sched_task_label(const IdfSchedTask& t, int index)
     return buf;
 }
 
-static void sched_set_job_message(const std::string& message)
+void sched_set_job_message(const std::string& message)
 {
     if (cell_job_lock()) {
         s_sched_job.message = message;
@@ -3017,7 +3089,7 @@ static void sched_set_job_message(const std::string& message)
     }
 }
 
-static bool sched_run_action(const IdfSchedRunView& cfg,
+bool sched_run_action(const IdfSchedRunView& cfg,
                              const IdfSchedTask& t,
                              const std::string& label,
                              std::string& message)
@@ -3026,7 +3098,7 @@ static bool sched_run_action(const IdfSchedRunView& cfg,
     if (!idf_config_validate_sched_task(t, &message)) return false;
     if (t.checkSystem) {
         std::string health;
-        if (!idf_modem_sms_health_check(health)) {
+        if (!idf_modem_sms_health_check(sim_, health)) {
             message = "系统短信组件检测失败：" + health;
             return false;
         }
@@ -3052,7 +3124,7 @@ static bool sched_run_action(const IdfSchedRunView& cfg,
             std::string url = t.target;
             if (url.empty()) url = cfg.kaUrl.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : cfg.kaUrl;
             IdfCellularHttpResult result;
-            esp_err_t err = idf_modem_cellular_http_get(url, cellular_http_config(cfg.dataEnabled, cfg.apn), result);
+            esp_err_t err = idf_modem_cellular_http_get(sim_, url, cellular_http_config(cfg.dataEnabled, cfg.apn), result);
             message = cellular_http_message(result);
             return err == ESP_OK && result.ok;
         }
@@ -3061,27 +3133,27 @@ static bool sched_run_action(const IdfSchedRunView& cfg,
                 message = "短信目标号码为空";
                 return false;
             }
-            if (t.checkReply && !idf_sms_reply_check_begin(t.replySender, t.replyBody)) {
+            if (t.checkReply && !idf_sms_reply_check_begin(sim_, t.replySender, t.replyBody)) {
                 message = "无法启动短信回复检测";
                 return false;
             }
             std::string sms_msg;
-            esp_err_t err = idf_sms_send_text(t.target,
+            esp_err_t err = idf_sms_send_text(sim_, t.target,
                                               t.payload.empty() ? std::string("scheduled task") : t.payload,
                                               sms_msg, t.checkReply);
             message = sms_msg;
             if (!t.checkReply) return err == ESP_OK;
             if (err != ESP_OK) {
-                idf_sms_reply_check_cancel();
+                idf_sms_reply_check_cancel(sim_);
                 return false;
             }
-            idf_sms_reply_check_arm(t.replyTimeoutSec);
+            idf_sms_reply_check_arm(sim_, t.replyTimeoutSec);
             sched_set_job_message(label + ": 已发送，等待匹配的短信回复");
             idf_logf("定时任务等待短信回复，超时 %d 秒", t.replyTimeoutSec);
             int result = 0;
             // 等待在独立任务内进行，不占 AT 锁，不阻塞短信接收或网页 scheduler。
-            while ((result = idf_sms_reply_check_poll()) == 0) vTaskDelay(pdMS_TO_TICKS(250));
-            idf_sms_reply_check_cancel();
+            while ((result = idf_sms_reply_check_poll(sim_)) == 0) vTaskDelay(pdMS_TO_TICKS(250));
+            idf_sms_reply_check_cancel(sim_);
             message = result > 0 ? "短信收发检测成功：已收到匹配回复" : "短信收发检测失败：等待匹配回复超时";
             return result > 0;
         }
@@ -3098,13 +3170,15 @@ static bool sched_run_action(const IdfSchedRunView& cfg,
     }
 }
 
-static void sched_task_worker(void* arg_raw)
+void sched_task_worker(void* arg_raw)
 {
     SchedTaskArg* arg = static_cast<SchedTaskArg*>(arg_raw);
+    bool same_card = arg->generation == idf_modem_get_status(sim_).generation;
     IdfSchedRunView cfg = std::move(arg->config);
     int index = arg->index;
     delete arg;
     const IdfSchedTask& t = cfg.task;
+    same_card = same_card && cfg.valid && t.sim == sim_;
     std::string label = sched_task_label(t, index);
     const uint32_t started_at = static_cast<uint32_t>(time(nullptr));
 
@@ -3119,8 +3193,9 @@ static void sched_task_worker(void* arg_raw)
     std::string message;
     bool ok = false;
     EsimJobSwitch sw;
-    bool prep_ok = true;
-    if (!t.profile.empty()) {
+    bool prep_ok = same_card && epoch_valid(started_at) && idf_config_set_sched_last_if(index, started_at, t) == ESP_OK;
+    if (!prep_ok) message = "卡身份已变更、时间未同步或执行标记保存失败；任务未执行";
+    if (prep_ok && !t.profile.empty()) {
         sched_set_job_message(label + ": 正在切换 eSIM Profile");
         std::string prep_msg;
         prep_ok = esim_prepare_profile(t.profile, sw, prep_msg);
@@ -3143,13 +3218,13 @@ static void sched_task_worker(void* arg_raw)
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     if (epoch_valid(now)) {
         if (ok) {
-            idf_config_set_sched_last(index, idf_scheduled_success_anchor(t.startMinute, started_at, now));
-        } else {
-            // 失败改为"明天重试"：每小时重试会反复切卡/发短信/跑流量，代价太高
+            idf_config_set_sched_last_if(index, idf_scheduled_success_anchor(t.startMinute, started_at, now), t);
+        } else if (t.action == 0) {
+            // 非计费通知失败才允许次日重试：每小时重试会反复切卡/发短信/跑流量，代价太高
             uint32_t days = t.intervalDays > 0 ? static_cast<uint32_t>(t.intervalDays) : 1u;
             uint64_t back = static_cast<uint64_t>(days - 1) * 86400ULL;
             uint32_t base = back < now ? now - static_cast<uint32_t>(back) : now;
-            idf_config_set_sched_last(index, base);
+            idf_config_set_sched_last_if(index, base, t);
         }
     }
 
@@ -3175,7 +3250,7 @@ static void sched_task_worker(void* arg_raw)
     vTaskDelete(nullptr);
 }
 
-static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& message, bool& already_running)
+bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& message, bool& already_running)
 {
     already_running = false;
     if (index < 0 || index >= IDF_MAX_SCHED_TASKS) {
@@ -3203,6 +3278,7 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     cell_job_unlock();
 
     SchedTaskArg* arg = new (std::nothrow) SchedTaskArg();
+    if (arg) arg->generation = idf_modem_get_status(sim_).generation;
     if (!arg) {
         if (cell_job_lock(portMAX_DELAY)) {
             s_sched_job.queued = false;
@@ -3216,7 +3292,7 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     }
     arg->config = cfg;
     arg->index = index;
-    if (xTaskCreate(sched_task_worker, "idf_schedtask", 8192, arg, 3, nullptr) != pdPASS) {
+    if (create_task(&WebInstance::sched_task_worker, "idf_schedtask", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_sched_job.queued = false;
@@ -3234,7 +3310,7 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
 
 // 每日任务的"上次执行日"落盘：重启会清掉内存标记，若重启恰在执行小时内，
 // 不落盘会当天重复执行。每个任务每天最多写一次，NVS 磨损可忽略。
-static int64_t load_daily_last_day(const char* key)
+int64_t load_daily_last_day(const char* key)
 {
     nvs_handle_t h;
     if (nvs_open("sms_state", NVS_READONLY, &h) != ESP_OK) return -1;
@@ -3244,7 +3320,7 @@ static int64_t load_daily_last_day(const char* key)
     return day;
 }
 
-static void store_daily_last_day(const char* key, int64_t day)
+void store_daily_last_day(const char* key, int64_t day)
 {
     nvs_handle_t h;
     if (nvs_open("sms_state", NVS_READWRITE, &h) != ESP_OK) return;
@@ -3253,13 +3329,13 @@ static void store_daily_last_day(const char* key, int64_t day)
     nvs_close(h);
 }
 
-static void scheduler_task(void*)
+void scheduler_task(void*)
 {
     uint32_t last_ka_check_ms = 0;
     bool prev_ka_enabled = false;
     IdfDailyHeartbeat heartbeat(load_daily_last_day("hb_day"));
     bool heartbeat_waiting_for_time = false;
-    int64_t health_last_day = load_daily_last_day("health_day");
+    int64_t health_last_day = load_daily_last_day(sim_ == 1 ? "health_day" : "health_day2");
     int64_t rb_last_day = -1;
 
     while (true) {
@@ -3269,12 +3345,12 @@ static void scheduler_task(void*)
             idf_logf("空闲堆低于阈值(%u<20000)，准备有序重启",
                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
             vTaskDelay(pdMS_TO_TICKS(300));
-            idf_modem_power_off_for_restart();
+            for (IdfModemId card = 1; card <= IDF_MODEM_COUNT; ++card) idf_modem_power_off_for_restart(card);
             esp_restart();
         }
 
         uint32_t now = static_cast<uint32_t>(time(nullptr));
-        IdfSchedulerView cfg = idf_config_get_scheduler_view();
+        IdfSchedulerView cfg = idf_config_get_scheduler_view(sim_);
         // 未校时并不影响普通短信推送，单独提示心跳为何尚未运行。
         bool heartbeat_needs_time = cfg.hbEnabled && !epoch_valid(now);
         if (heartbeat_needs_time && !heartbeat_waiting_for_time) {
@@ -3293,13 +3369,13 @@ static void scheduler_task(void*)
                 if (cfg.kaEnabled && !epoch_valid(cfg.kaLastTime)) {
                     // 首次启用/无基准日：只建立基准日，绝不立即执行——
                     // 否则刚开启保号就真发短信/USSD/跑流量，可能直接扣费
-                    idf_config_set_keepalive_last(now);
+                    idf_config_set_keepalive_last(sim_, now);
                     idf_log_line("保号基准日已建立(首次启用不执行动作)");
                 } else if (cfg.kaEnabled && cfg.kaIntervalDays > 0 &&
                            keepalive_due(cfg.kaLastTime, now, static_cast<uint32_t>(cfg.kaIntervalDays))) {
                     std::string msg;
                     bool already = false;
-                    IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view();
+                    IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view(sim_);
                     bool still_due = run_cfg.kaEnabled && run_cfg.kaIntervalDays > 0 &&
                         keepalive_due(run_cfg.kaLastTime, now, static_cast<uint32_t>(run_cfg.kaIntervalDays));
                     if (still_due) {
@@ -3319,7 +3395,7 @@ static void scheduler_task(void*)
 
             for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
                 const IdfSchedTask& t = cfg.schedTasks[i];
-                if (!t.enabled || t.intervalDays <= 0) continue;
+                if (t.sim != sim_ || !t.enabled || t.intervalDays <= 0) continue;
                 if (!epoch_valid(t.lastRun)) {
                     // 老配置/时间未同步时启用的任务：先建立基准日，不立即执行
                     idf_config_set_sched_last(i, now);
@@ -3328,7 +3404,7 @@ static void scheduler_task(void*)
                 if (!idf_scheduled_task_due(t.lastRun, now, t.intervalDays, t.startMinute, cfg.tzOffsetMin)) continue;
                 std::string msg;
                 bool already = false;
-                IdfSchedRunView run_cfg = idf_config_get_sched_run_view(i);
+                IdfSchedRunView run_cfg = idf_config_get_sched_run_view(sim_, i);
                 const IdfSchedTask& latest = run_cfg.task;
                 bool still_due = run_cfg.valid && latest.enabled && latest.intervalDays > 0 &&
                     epoch_valid(latest.lastRun) &&
@@ -3347,26 +3423,30 @@ static void scheduler_task(void*)
             int64_t day = local / 86400LL;
             if (local < 0 && (local % 86400LL) != 0) --day;
 
-            heartbeat.poll(cfg.hbEnabled, cfg.hbHour, now, cfg.tzOffsetMin,
+            heartbeat.poll(sim_ == IDF_SIM1 && cfg.hbEnabled, cfg.hbHour, now, cfg.tzOffsetMin,
                            static_cast<uint64_t>(esp_timer_get_time() / 1000ULL), [&]() {
-                IdfSmsStatus sms = idf_sms_get_status();
-                char body[192];
-                snprintf(body, sizeof(body), "设备运行正常。\n累计转发: %u 条\n空闲堆: %u KB",
-                         static_cast<unsigned>(sms.total),
+                IdfSmsStatus sms = idf_sms_get_status(sim_);
+                char body[320];
+                const auto m1 = idf_modem_get_status(1);
+                const auto m2 = idf_modem_get_status(2);
+                snprintf(body, sizeof(body), "双模组设备心跳。\nSIM1: %s (%s)\nSIM2: %s (%s)\n累计转发: %u 条\n空闲堆: %u KB",
+                         m1.modemReady ? "就绪" : "未就绪", m1.phase.c_str(),
+                         m2.modemReady ? "就绪" : "未就绪", m2.phase.c_str(),
+                         static_cast<unsigned>(sms.total + idf_sms_get_status(2).total),
                          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024U));
                 return enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled,
                                                   "设备每日心跳", body, now);
-            }, [](int64_t queued_day) {
+            }, [this](int64_t queued_day) {
                 // 只有成功交给至少一个推送/邮件队列后，才保存当日标记。
                 store_daily_last_day("hb_day", queued_day);
             });
 
             if (cfg.smsHealthEnabled && hour == cfg.smsHealthHour &&
-                day > health_last_day && idf_modem_at_idle()) {
+                day > health_last_day && idf_modem_at_idle(sim_)) {
                 health_last_day = day;
-                store_daily_last_day("health_day", day);
+                store_daily_last_day(sim_ == 1 ? "health_day" : "health_day2", day);
                 std::string health;
-                bool health_ok = idf_modem_sms_health_check(health);
+                bool health_ok = idf_modem_sms_health_check(sim_, health);
                 if (!health_ok && cfg.smsHealthNotify) {
                     enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled,
                                                "设备每日短信体检异常", health, now);
@@ -3374,13 +3454,13 @@ static void scheduler_task(void*)
             }
 
             uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
-            if (cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
+            if (sim_ == IDF_SIM1 && cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
                 uptime_ms >= 7200000ULL && system_idle_for_maintenance()) {
                 rb_last_day = day;
                 idf_log_line("每日定时重启...");
                 vTaskDelay(pdMS_TO_TICKS(300));
                 // 每日重启是无人值守设备的兜底自愈手段，必须连模组一起冷启动
-                idf_modem_power_off_for_restart();
+                for (IdfModemId card = 1; card <= IDF_MODEM_COUNT; ++card) idf_modem_power_off_for_restart(card);
                 esp_restart();
             }
         }
@@ -3388,7 +3468,7 @@ static void scheduler_task(void*)
     }
 }
 
-static esp_err_t handle_ping(httpd_req_t* req)
+esp_err_t handle_ping(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -3402,7 +3482,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
             job = s_ping_job;
             cell_job_unlock();
         }
-        std::string body = "{\"running\":";
+        std::string body = "{\"sim\":" + std::to_string(sim_) + ",\"running\":";
         body += job.running ? "true" : "false";
         body += ",\"done\":";
         body += job.done ? "true" : "false";
@@ -3425,7 +3505,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     IdfFormFields fields = parse_urlencoded(raw);
     const std::string* url_field = find_field(fields, "url");
     std::string url = idf_util_trim_copy(url_field ? *url_field : std::string());
-    IdfKeepaliveRunView current = idf_config_get_keepalive_run_view();
+    IdfKeepaliveRunView current = idf_config_get_keepalive_run_view(sim_);
     if (url.empty()) url = current.kaUrl.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : current.kaUrl;
 
     std::string err_msg;
@@ -3452,6 +3532,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     cell_job_unlock();
 
     PingTaskArg* arg = new (std::nothrow) PingTaskArg();
+    if (arg) arg->generation = idf_modem_get_status(sim_).generation;
     if (!arg) {
         // 终态必须写进去(portMAX_DELAY)：300ms 拿锁失败就放弃的话,
         // running 永远为 true，之后所有蜂窝任务被"任务正忙"挡到重启为止
@@ -3467,7 +3548,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     }
     arg->url = url;
     arg->cellular = cellular_http_config(current.dataEnabled, current.apn);
-    if (xTaskCreate(ping_task, "idf_ping_http", 6144, arg, 3, nullptr) != pdPASS) {
+    if (create_task(&WebInstance::ping_task, "idf_ping_http", 6144, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_ping_job.running = false;
@@ -3484,7 +3565,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     return httpd_resp_sendstr(req, "{\"success\":true,\"running\":true,\"message\":\"已开始后台HTTP payload下载，可继续刷新网页\"}");
 }
 
-static esp_err_t handle_esim(httpd_req_t* req)
+esp_err_t handle_esim(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -3502,7 +3583,7 @@ static esp_err_t handle_esim(httpd_req_t* req)
             httpd_resp_set_status(req, "503 Service Unavailable");
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
         }
-        IdfConfigStatusView cfg = idf_config_get_status_view();
+        IdfConfigStatusView cfg = idf_config_get_status_view(sim_);
         std::string body;
         body.reserve(1020 + profiles.size() * 260);
         char buf[192];
@@ -3519,6 +3600,7 @@ static esp_err_t handle_esim(httpd_req_t* req)
                  static_cast<unsigned>(updated_at),
                  static_cast<unsigned>(profiles.size()));
         body += buf;
+        body += "\"sim\":" + std::to_string(sim_) + ",\"capability\":" + std::to_string(idf_esim_capability(sim_)) + ",";
         json_prop(body, "action", job.action); body += ",";
         json_prop(body, "eid", eid); body += ",";
         json_prop(body, "updatedLocal", format_epoch_local(updated_at, cfg.tzOffsetMin)); body += ",";
@@ -3538,6 +3620,8 @@ static esp_err_t handle_esim(httpd_req_t* req)
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
+    if (action != "refresh" && action != "info" && idf_esim_capability(sim_) != 1)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "eSIM capability not confirmed; query first");
     if (req->method != HTTP_POST) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 操作需要 POST\"}");
     }
@@ -3662,7 +3746,7 @@ static esp_err_t handle_esim(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_keepalive(httpd_req_t* req)
+esp_err_t handle_keepalive(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -3680,7 +3764,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
             return httpd_resp_sendstr(req,
                 "{\"success\":false,\"message\":\"设备时间未同步，暂不能重置基准日，请等待 NTP 同步后重试\"}");
         }
-        esp_err_t err = idf_config_set_keepalive_last(now);
+        esp_err_t err = idf_config_set_keepalive_last(sim_, now);
         if (err == ESP_OK) {
             int tz = idf_config_get_tz_offset();
             std::string local = format_epoch_local(now, tz);
@@ -3705,7 +3789,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
         }
         std::string message;
         bool already_running = false;
-        IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view();
+        IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view(sim_);
         bool ok = start_keepalive_job(run_cfg, "保号动作已排队，可继续刷新网页",
                                       message, already_running);
         std::string body = "{\"success\":";
@@ -3718,7 +3802,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
-    const IdfKeepaliveRunView cfg = idf_config_get_keepalive_run_view();
+    const IdfKeepaliveRunView cfg = idf_config_get_keepalive_run_view(sim_);
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     bool time_valid = now >= 1700000000u;
     int days_left = 0;
@@ -3744,6 +3828,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
              cfg.kaEnabled ? "true" : "false", cfg.kaIntervalDays,
              static_cast<unsigned>(cfg.kaAction));
     body += buf;
+    body += "\"sim\":" + std::to_string(sim_) + ",";
     json_prop(body, "target", cfg.kaTarget); body += ",";
     json_prop(body, "url", cfg.kaUrl); body += ",";
     json_prop(body, "profile", cfg.kaProfile); body += ",";
@@ -3777,7 +3862,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_schedtask(httpd_req_t* req)
+esp_err_t handle_schedtask(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
@@ -3797,6 +3882,8 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
         if (index < 0 || index >= IDF_MAX_SCHED_TASKS) {
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"任务序号无效\"}");
         }
+        if (!idf_config_get_sched_run_view(sim_, index).valid)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Task belongs to another SIM");
         if (action == "reset") {
             uint32_t now = static_cast<uint32_t>(time(nullptr));
             if (!epoch_valid(now)) {
@@ -3814,7 +3901,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
         }
         std::string message;
         bool already = false;
-        IdfSchedRunView run_cfg = idf_config_get_sched_run_view(index);
+        IdfSchedRunView run_cfg = idf_config_get_sched_run_view(sim_, index);
         bool ok = start_sched_job(run_cfg, index, message, already);
         if (ok) idf_logf("网页手动触发定时任务%d", index + 1);
         std::string body = "{\"success\":";
@@ -3828,7 +3915,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
     }
 
     // status：任务配置 + 倒计时 + 后台执行状态（窄快照，此端点任务期间被 2s 轮询）
-    IdfSchedulerView cfg = idf_config_get_scheduler_view();
+    IdfSchedulerView cfg = idf_config_get_scheduler_view(sim_);
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     bool time_valid = epoch_valid(now);
     WebAsyncJob job;
@@ -3869,6 +3956,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
                  days_left,
                  static_cast<unsigned>(t.lastRun));
         body += buf;
+        body += "\"sim\":" + std::to_string(t.sim) + ",";
         json_prop(body, "name", t.name); body += ",";
         json_prop(body, "profile", t.profile); body += ",";
         json_prop(body, "target", t.target); body += ",";
@@ -3888,7 +3976,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
 
 // NET 指示灯立即开关：只发 AT 不写配置；模组自身可能记住该状态，
 // 但每次模组初始化固件都会按已保存的配置重新下发覆盖
-static esp_err_t handle_netled(httpd_req_t* req)
+esp_err_t handle_netled(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -3902,10 +3990,10 @@ static esp_err_t handle_netled(httpd_req_t* req)
     if (!on && action != "off") {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未知动作\"}");
     }
-    WebModemActionGuard modem_action;
+    WebModemActionGuard modem_action(*this);
     if (!modem_action.begin(req)) return ESP_OK;
     std::string resp;
-    esp_err_t err = idf_modem_send_at(on ? "AT+MLED=0,1" : "AT+MLED=0,0", 3000, resp);
+    esp_err_t err = idf_modem_send_at(sim_, on ? "AT+MLED=0,1" : "AT+MLED=0,0", 3000, resp);
     bool ok = (err == ESP_OK && resp.find("OK") != std::string::npos);
     idf_logf("%s NET 指示灯: %s", on ? "开启" : "关闭", ok ? "成功" : "失败(模组不支持或忙)");
     std::string body = "{\"success\":";
@@ -3918,14 +4006,14 @@ static esp_err_t handle_netled(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_ntp(httpd_req_t* req)
+esp_err_t handle_ntp(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     esp_err_t err = idf_wifi_resync_ntp();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
-    const IdfConfigStatusView cfg = idf_config_get_status_view();
+    const IdfConfigStatusView cfg = idf_config_get_status_view(sim_);
     std::string body = "{\"success\":";
     body += (err == ESP_OK) ? "true" : "false";
     body += ",";
@@ -3940,7 +4028,7 @@ static esp_err_t handle_ntp(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-static esp_err_t handle_reboot(httpd_req_t* req)
+esp_err_t handle_reboot(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
@@ -3951,7 +4039,7 @@ static esp_err_t handle_reboot(httpd_req_t* req)
     return send_err;
 }
 
-static esp_err_t handle_not_found(httpd_req_t* req)
+esp_err_t handle_not_found(httpd_req_t* req)
 {
     if (idf_wifi_get_status().apMode) {
         httpd_resp_set_status(req, "302 Found");
@@ -3962,13 +4050,41 @@ static esp_err_t handle_not_found(httpd_req_t* req)
     return ESP_OK;
 }
 
-static esp_err_t register_handler(httpd_handle_t server, const char* uri, int method,
-                                  esp_err_t (*handler)(httpd_req_t*))
+using Handler = esp_err_t (WebInstance::*)(httpd_req_t*);
+static inline Handler handlers_[48] = {};
+static inline size_t handler_count_ = 0;
+static WebInstance& instance(IdfModemId sim);
+static esp_err_t dispatch(httpd_req_t* req)
 {
+    const size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len >= 2048) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Query too long");
+    std::string query(query_len + 1, '\0');
+    IdfModemId sim = IDF_SIM1;
+    if (query.size() > 1) {
+        if (httpd_req_get_url_query_str(req, &query[0], query.size()) != ESP_OK)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid query");
+        query.pop_back();
+        auto fields = instance(IDF_SIM1).parse_urlencoded(query);
+        int count = 0;
+        for (const auto& field : fields) if (field.first == "sim") {
+            if (++count > 1 || (field.second != "1" && field.second != "2"))
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "sim must be 1 or 2");
+            sim = static_cast<IdfModemId>(field.second[0] - '0');
+        }
+    }
+    httpd_resp_set_hdr(req, "X-Modem-Sim", sim == 1 ? "1" : "2");
+    Handler handler = *static_cast<Handler*>(req->user_ctx);
+    return (instance(sim).*handler)(req);
+}
+esp_err_t register_handler(httpd_handle_t server, const char* uri, int method, Handler handler)
+{
+    if (handler_count_ >= 48) return ESP_ERR_NO_MEM;
     httpd_uri_t item = {};
     item.uri = uri;
     item.method = static_cast<httpd_method_t>(method);
-    item.handler = handler;
+    handlers_[handler_count_] = handler;
+    item.user_ctx = &handlers_[handler_count_++];
+    item.handler = dispatch;
     return httpd_register_uri_handler(server, &item);
 }
 
@@ -4022,49 +4138,56 @@ esp_err_t idf_web_start(void)
         if (_reg_err != ESP_OK) return _reg_err; \
     } while (0)
 
-    IDF_WEB_TRY_REGISTER("/", register_handler(s_server, "/", HTTP_GET, handle_root));
-    IDF_WEB_TRY_REGISTER("/tools", register_handler(s_server, "/tools", HTTP_GET, handle_root));
-    IDF_WEB_TRY_REGISTER("/sms", register_handler(s_server, "/sms", HTTP_GET, handle_root));
-    IDF_WEB_TRY_REGISTER("/assets/*", register_handler(s_server, "/assets/*", HTTP_GET, handle_asset));
-    IDF_WEB_TRY_REGISTER("/ui", register_handler(s_server, "/ui", HTTP_GET, handle_ui_panel));
-    IDF_WEB_TRY_REGISTER("/status", register_handler(s_server, "/status", HTTP_GET, handle_status));
-    IDF_WEB_TRY_REGISTER("/config.json", register_handler(s_server, "/config.json", HTTP_GET, send_config_json));
-    IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, handle_save));
-    IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_ANY, handle_wifi));
-    IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, handle_ntp));
-    IDF_WEB_TRY_REGISTER("/wifiscan", register_handler(s_server, "/wifiscan", HTTP_GET, handle_wifi_scan));
-    IDF_WEB_TRY_REGISTER("/wificonfig", register_handler(s_server, "/wificonfig", HTTP_POST, handle_wifi_config));
-    IDF_WEB_TRY_REGISTER("/apstatus", register_handler(s_server, "/apstatus", HTTP_GET, handle_apstatus));
-    IDF_WEB_TRY_REGISTER("/messages", register_handler(s_server, "/messages", HTTP_GET, handle_messages));
-    IDF_WEB_TRY_REGISTER("/log", register_handler(s_server, "/log", HTTP_GET, handle_empty_log));
-    IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, handle_keepalive));
-    IDF_WEB_TRY_REGISTER("/esim", register_handler(s_server, "/esim", HTTP_ANY, handle_esim));
-    IDF_WEB_TRY_REGISTER("/schedtask", register_handler(s_server, "/schedtask", HTTP_ANY, handle_schedtask));
-    IDF_WEB_TRY_REGISTER("/netled POST", register_handler(s_server, "/netled", HTTP_POST, handle_netled));
-    IDF_WEB_TRY_REGISTER("/reboot", register_handler(s_server, "/reboot", HTTP_POST, handle_reboot));
-    IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, handle_at));
-    IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, handle_ping));
-    IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));
-    IDF_WEB_TRY_REGISTER("/testrule", register_handler(s_server, "/testrule", HTTP_POST, handle_test_rule));
-    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));
-    IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, handle_flight));
-    IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_ANY, handle_modem_control));
-    IDF_WEB_TRY_REGISTER("/sendsms", register_handler(s_server, "/sendsms", HTTP_POST, handle_send_sms));
-    IDF_WEB_TRY_REGISTER("/resend", register_handler(s_server, "/resend", HTTP_POST, handle_resend_message));
-    IDF_WEB_TRY_REGISTER("/delete", register_handler(s_server, "/delete", HTTP_POST, handle_delete_message));
-    IDF_WEB_TRY_REGISTER("/factory", register_handler(s_server, "/factory", HTTP_POST, handle_factory_reset));
-    IDF_WEB_TRY_REGISTER("/import", register_handler(s_server, "/import", HTTP_POST, handle_import_config));
-    IDF_WEB_TRY_REGISTER("/update", register_handler(s_server, "/update", HTTP_POST, handle_ota_update));
-    IDF_WEB_TRY_REGISTER("/export", register_handler(s_server, "/export", HTTP_GET, handle_export_config));
-    IDF_WEB_TRY_REGISTER("/logdownload", register_handler(s_server, "/logdownload", HTTP_GET, handle_log_download));
-    IDF_WEB_TRY_REGISTER("/prevlog", register_handler(s_server, "/prevlog", HTTP_GET, handle_prev_log));
-    IDF_WEB_TRY_REGISTER("/coredump", register_handler(s_server, "/coredump", HTTP_GET, handle_coredump_download));
-    IDF_WEB_TRY_REGISTER("/coredump/clear", register_handler(s_server, "/coredump/clear", HTTP_POST, handle_coredump_clear));
-    IDF_WEB_TRY_REGISTER("/*", register_handler(s_server, "/*", HTTP_GET, handle_not_found));
+    IDF_WEB_TRY_REGISTER("/", register_handler(s_server, "/", HTTP_GET, &WebInstance::handle_root));
+    IDF_WEB_TRY_REGISTER("/tools", register_handler(s_server, "/tools", HTTP_GET, &WebInstance::handle_root));
+    IDF_WEB_TRY_REGISTER("/sms", register_handler(s_server, "/sms", HTTP_GET, &WebInstance::handle_root));
+    IDF_WEB_TRY_REGISTER("/assets/*", register_handler(s_server, "/assets/*", HTTP_GET, &WebInstance::handle_asset));
+    IDF_WEB_TRY_REGISTER("/ui", register_handler(s_server, "/ui", HTTP_GET, &WebInstance::handle_ui_panel));
+    IDF_WEB_TRY_REGISTER("/status", register_handler(s_server, "/status", HTTP_GET, &WebInstance::handle_status));
+    IDF_WEB_TRY_REGISTER("/config.json", register_handler(s_server, "/config.json", HTTP_GET, &WebInstance::send_config_json));
+    IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, &WebInstance::handle_save));
+    IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_ANY, &WebInstance::handle_wifi));
+    IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, &WebInstance::handle_ntp));
+    IDF_WEB_TRY_REGISTER("/wifiscan", register_handler(s_server, "/wifiscan", HTTP_GET, &WebInstance::handle_wifi_scan));
+    IDF_WEB_TRY_REGISTER("/wificonfig", register_handler(s_server, "/wificonfig", HTTP_POST, &WebInstance::handle_wifi_config));
+    IDF_WEB_TRY_REGISTER("/apstatus", register_handler(s_server, "/apstatus", HTTP_GET, &WebInstance::handle_apstatus));
+    IDF_WEB_TRY_REGISTER("/messages", register_handler(s_server, "/messages", HTTP_GET, &WebInstance::handle_messages));
+    IDF_WEB_TRY_REGISTER("/log", register_handler(s_server, "/log", HTTP_GET, &WebInstance::handle_empty_log));
+    IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, &WebInstance::handle_keepalive));
+    IDF_WEB_TRY_REGISTER("/esim", register_handler(s_server, "/esim", HTTP_ANY, &WebInstance::handle_esim));
+    IDF_WEB_TRY_REGISTER("/schedtask", register_handler(s_server, "/schedtask", HTTP_ANY, &WebInstance::handle_schedtask));
+    IDF_WEB_TRY_REGISTER("/netled POST", register_handler(s_server, "/netled", HTTP_POST, &WebInstance::handle_netled));
+    IDF_WEB_TRY_REGISTER("/reboot", register_handler(s_server, "/reboot", HTTP_POST, &WebInstance::handle_reboot));
+    IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, &WebInstance::handle_at));
+    IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, &WebInstance::handle_ping));
+    IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, &WebInstance::handle_test_push));
+    IDF_WEB_TRY_REGISTER("/testrule", register_handler(s_server, "/testrule", HTTP_POST, &WebInstance::handle_test_rule));
+    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, &WebInstance::handle_ussd));
+    IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, &WebInstance::handle_flight));
+    IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_ANY, &WebInstance::handle_modem_control));
+    IDF_WEB_TRY_REGISTER("/sendsms", register_handler(s_server, "/sendsms", HTTP_POST, &WebInstance::handle_send_sms));
+    IDF_WEB_TRY_REGISTER("/resend", register_handler(s_server, "/resend", HTTP_POST, &WebInstance::handle_resend_message));
+    IDF_WEB_TRY_REGISTER("/delete", register_handler(s_server, "/delete", HTTP_POST, &WebInstance::handle_delete_message));
+    IDF_WEB_TRY_REGISTER("/factory", register_handler(s_server, "/factory", HTTP_POST, &WebInstance::handle_factory_reset));
+    IDF_WEB_TRY_REGISTER("/import", register_handler(s_server, "/import", HTTP_POST, &WebInstance::handle_import_config));
+    IDF_WEB_TRY_REGISTER("/update", register_handler(s_server, "/update", HTTP_POST, &WebInstance::handle_ota_update));
+    IDF_WEB_TRY_REGISTER("/export", register_handler(s_server, "/export", HTTP_GET, &WebInstance::handle_export_config));
+    IDF_WEB_TRY_REGISTER("/logdownload", register_handler(s_server, "/logdownload", HTTP_GET, &WebInstance::handle_log_download));
+    IDF_WEB_TRY_REGISTER("/prevlog", register_handler(s_server, "/prevlog", HTTP_GET, &WebInstance::handle_prev_log));
+    IDF_WEB_TRY_REGISTER("/coredump", register_handler(s_server, "/coredump", HTTP_GET, &WebInstance::handle_coredump_download));
+    IDF_WEB_TRY_REGISTER("/coredump/clear", register_handler(s_server, "/coredump/clear", HTTP_POST, &WebInstance::handle_coredump_clear));
+    IDF_WEB_TRY_REGISTER("/*", register_handler(s_server, "/*", HTTP_GET, &WebInstance::handle_not_found));
 
 #undef IDF_WEB_TRY_REGISTER
+    start_scheduler();
+    ESP_LOGI(TAG, "ESP-IDF web server registered UI and bootstrap dynamic routes");
+    idf_log_line("HTTP 服务器已启动");
+    return ESP_OK;
+}
+
+void start_scheduler() {
     if (!s_scheduler_started) {
-        BaseType_t ok = xTaskCreate(scheduler_task, "idf_sched", 8192, nullptr, 2, nullptr);
+        BaseType_t ok = create_task(&WebInstance::scheduler_task, "idf_sched", 8192, nullptr, 2, nullptr);
         if (ok == pdPASS) {
             s_scheduler_started = true;
             idf_log_line("定时任务 scheduler 已启动");
@@ -4073,7 +4196,17 @@ esp_err_t idf_web_start(void)
             idf_log_line("定时任务 scheduler 启动失败");
         }
     }
-    ESP_LOGI(TAG, "ESP-IDF web server registered UI and bootstrap dynamic routes");
-    idf_log_line("HTTP 服务器已启动");
-    return ESP_OK;
+}
+
+};
+static WebInstance web_instances[IDF_MODEM_COUNT] = {WebInstance(IDF_SIM1), WebInstance(IDF_SIM2)};
+WebInstance& WebInstance::instance(IdfModemId sim) { return web_instances[sim - 1]; }
+esp_err_t idf_web_start(void) {
+    for (auto& web : web_instances) {
+        if (!web.s_cell_job_mutex) web.s_cell_job_mutex = xSemaphoreCreateMutex();
+        if (!web.s_cell_job_mutex) return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = web_instances[0].idf_web_start();
+    if (err == ESP_OK) web_instances[1].start_scheduler();
+    return err;
 }

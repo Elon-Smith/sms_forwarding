@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """在主机上编译真实模组函数和调度片段，回归慢卡读取与刷新排队行为。"""
 from pathlib import Path
+import os
+import shlex
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-source = (ROOT / 'components/idf_modem/idf_modem.cpp').read_text()
+source = (ROOT / 'components/idf_modem/idf_modem.cpp').read_text(encoding="utf-8")
 
 
 def function(name):
@@ -22,10 +24,10 @@ functions = '\n\n'.join(function(name) for name in [
 start = source.index('        bool force_sample =')
 end = source.index('        // 正常态', start)
 sampling = source[start:end]
-fixture = (ROOT / 'tests/modem_refresh_test.cpp').read_text()
+fixture = (ROOT / 'tests/modem_refresh_test.cpp').read_text(encoding="utf-8")
 fixture = fixture.replace('// @查询函数@', functions)
 fixture = fixture.replace('// @采样代码@', sampling)
-web = (ROOT / 'components/idf_web/idf_web.cpp').read_text()
+web = (ROOT / 'components/idf_web/idf_web.cpp').read_text(encoding="utf-8")
 start = web.index('        esp_err_t err =', web.index('} else if (action == "operator")'))
 end = web.index('    } else if (action == "imei")', start)
 fixture = fixture.replace('// @手动运营商查询@', web[start:end])
@@ -33,18 +35,18 @@ fixture = fixture.replace('// @手动运营商查询@', web[start:end])
 with tempfile.TemporaryDirectory(prefix='test-modem-', dir=ROOT / 'build') as temp:
     cpp = Path(temp) / 'test.cpp'
     binary = Path(temp) / 'test'
-    cpp.write_text(fixture)
-    subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+    cpp.write_text(fixture, encoding="utf-8")
+    subprocess.run([*shlex.split(os.environ.get('CXX', 'c++')), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-I', str(ROOT / 'components/idf_modem/include'),
                     '-I', str(ROOT / 'components/idf_config/include'),
                     str(cpp), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
 # 同时编译真实身份采样/状态更新/换卡函数，避免仅验证调度替身而漏掉 CNUM 条件。
-header = (ROOT / 'components/idf_modem/include/idf_modem.h').read_text()
+header = (ROOT / 'components/idf_modem/include/idf_modem.h').read_text(encoding="utf-8")
 begin = header.index('struct IdfModemStatus {')
 end = header.index('\n};', begin) + 3
-phone_fixture = (ROOT / 'tests/modem_phone_refresh_test.cpp').read_text()
+phone_fixture = (ROOT / 'tests/modem_phone_refresh_test.cpp').read_text(encoding="utf-8")
 phone_fixture = phone_fixture.replace('// @状态结构@', header[begin:end])
 phone_fixture = phone_fixture.replace('// @真实函数@', '\n\n'.join(function(name) for name in [
     'is_imei_text(', 'is_imsi_text(', 'is_iccid_text(', 'update_status(',
@@ -57,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix='test-phone-', dir=ROOT / 'build') as te
     cpp = Path(temp) / 'test.cpp'
     binary = Path(temp) / 'test'
     cpp.write_text(phone_fixture)
-    subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+    subprocess.run([*shlex.split(os.environ.get('CXX', 'c++')), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-I', str(ROOT / 'components/idf_config/include'),
                     str(cpp), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

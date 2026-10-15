@@ -60,6 +60,7 @@ esp_err_t idf_modem_send_at(const std::string& command, uint32_t timeout, std::s
     return reply.latency <= timeout ? reply.error : ESP_ERR_TIMEOUT;
 }
 // @查询函数@
+esp_err_t idf_modem_get_operator(int sim, std::string& name) { assert(sim==2); return idf_modem_get_operator(name); }
 
 struct IdfModemStatus { bool atReady = false; std::string cellIp; };
 struct IdfSimSettingsView { bool dataEnabled = false; };
@@ -75,7 +76,8 @@ IdfModemStatus status;
 bool idle = true, inject_request = false, last_log_summary = false, last_network = false;
 int sampled = 0;
 IdfModemStatus idf_modem_get_status() { return status; }
-IdfSimSettingsView idf_config_get_sim_settings_view() { return {}; }
+constexpr int sim_ = 2;
+IdfSimSettingsView idf_config_get_sim_settings_view(int sim) { assert(sim==2); return {}; }
 bool startup_info_complete() { return false; }
 bool startup_sampling_done() { return true; }
 bool at_channel_idle_now() { return idle; }

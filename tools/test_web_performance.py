@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """编译真实页面模板处理器与日志增量函数，检查缓存边界、环回与空轮询内存。"""
 from pathlib import Path
+import os
+import shlex
 import subprocess
 import tempfile
 
@@ -21,5 +23,5 @@ with tempfile.TemporaryDirectory(prefix="test-web-perf-", dir=ROOT / "build") as
     source = Path(temp) / "test.cpp"
     binary = Path(temp) / "test.exe"
     source.write_text(fixture, encoding="utf-8")
-    subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
+    subprocess.run([*shlex.split(os.environ.get("CXX", "c++")), "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

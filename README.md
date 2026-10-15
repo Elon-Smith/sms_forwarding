@@ -1,3 +1,5 @@
+> **本分支：ESP32-C3 双 ML307C 候选版，尚未通过实机验收。** 固定上游 1.1.7 / ESP-IDF 6.0.2。请先阅读 [双卡接线、构建与安装指南](dev_doc/upstream_dual_modem.md) 和 [验证记录](dev_doc/upstream_dual_test_report.md)。下方保留上游说明；单模组固件与原烧录说明不适用于本分支首次安装。
+
 ![SMS Forwarding — Reliable messages. Anywhere.](assets/brand/banner.svg)
 
 <h1>

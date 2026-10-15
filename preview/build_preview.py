@@ -27,7 +27,7 @@ def read(path: Path) -> str:
     )
 
 
-index = read(SRC / "index.html")
+index = read(SRC / "index.html").replace("<title>", "<title>MOCK 双卡预览 · ")
 css = read(SRC / "app.css")
 js = read(SRC / "app.js")
 panels = {name: read(SRC / "panels" / f"{name}.html") for name in PANELS}
@@ -50,7 +50,7 @@ mock_config = {
     "emailConfigured": True,
     "modemReady": True,
     "pushEnabledCount": 2,
-    "inboxMax": 120,
+    "inboxMax": 50,
     "ntpServer": "ntp.aliyun.com",
     "tzOffsetMin": 480,
     "rebootEnabled": True,
@@ -101,7 +101,8 @@ mock_config = {
 }
 
 mock_status = {
-    "version": "1.1.7-preview",
+    "version": "1.1.7-dual.1-preview",
+    "modems": [{"sim":i,"ready":True,"phase":"ready","smsTotal":i*4,"callCapability":0,"esimCapability":0} for i in (1,2)],
     "modemReady": True,
     "modemPhase": "ready",
     "wifiConnected": True,
@@ -128,8 +129,8 @@ mock_status = {
     "imsi": "23410••••••••123",
     "apnSim": "giffgaff.com",
     "mfr": "MeiG",
-    "model": "ML307R",
-    "fwver": "ML307R-demo",
+    "model": "ML307C-DC-CN-MBRH0S00",
+    "fwver": "ML307C-demo",
     "phone": "+44 7700 900123",
     "dataEnabled": False,
     "apn": "giffgaff.com",
@@ -193,7 +194,7 @@ mock_messages = [
 
 mock_sent = [
     {"id": 3, "sent": 1783040000, "target": "43430", "text": "BAL", "ok": True},
-    {"id": 2, "sent": 1783030000, "target": "+44 7700 900456", "text": "设备测试短信", "ok": True},
+    {"sim": 2, "id": 2, "sent": 1783030000, "target": "+44 7700 900456", "text": "设备测试短信", "ok": True},
 ]
 
 mock_log = [
@@ -213,6 +214,9 @@ mock_log = [
     "发送到推送通道: Bark 自建",
     "[Bark 自建] HTTP 响应码: 200",
 ]
+
+for i, row in enumerate(mock_messages): row["sim"] = 1 + i % 2
+for i, row in enumerate(mock_sent): row["sim"] = 1 + i % 2
 
 stub = f"""<script>
 /* PREVIEW ONLY — mock fetch，不包含真实号码、密钥、邮箱或设备标识。 */
@@ -239,7 +243,7 @@ stub = f"""<script>
     }}
     if (url.indexOf('/status') >= 0) return resp(status);
     if (url.indexOf('/esim') >= 0) return resp({{
-      success:true, eid:'89049032000000000000000000000001', updatedLocal:'2026-10-12 20:40:00', profileCount:2,
+      success:true, capability:0, eid:'89049032000000000000000000000001', updatedLocal:'2026-10-12 20:40:00', profileCount:2,
       profiles:[
         {{iccid:'89440000000000000000', nickname:'主用短信卡', state:'enabled'}},
         {{iccid:'89860000000000000001', nickname:'备用卡', state:'disabled'}}
@@ -247,7 +251,9 @@ stub = f"""<script>
     }});
     if (url.indexOf('/messages') >= 0 && url.indexOf('box=sent') >= 0) return resp(sent);
     if (url.indexOf('/messages') >= 0) {{
-      var limited = url.indexOf('limit=1') >= 0 ? messages.slice(0, 1) : messages;
+      var params = new URL(url, location.href).searchParams;
+      var selected = messages.filter(function(m) {{ return params.get('scope') === 'all' || m.sim === Number(params.get('sim') || 1); }});
+      var limited = url.indexOf('limit=1') >= 0 ? selected.slice(0, 1) : selected;
       return resp(limited);
     }}
     if (url.indexOf('/log') >= 0) {{

@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <stdint.h>
 
@@ -31,3 +32,6 @@ IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,
 
 bool idf_push_enqueue_test(uint8_t channel, std::string& message);
 std::string idf_push_test_status_json(uint8_t channel);
+
+bool idf_push_enqueue_forward(IdfModemId sim, const char* sender, const char* text, const char* timestamp, uint32_t inbox_id);
+IdfForwardRuleDecision idf_push_eval_forward_rules(IdfModemId sim, const std::string& rules, const std::string& sender, const std::string& body);

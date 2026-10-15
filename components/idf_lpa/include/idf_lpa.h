@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <stddef.h>
 
@@ -72,3 +73,11 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
                                        const LpaDownloadObserver& observer,
                                        LpaDownloadStats& stats,
                                        std::string& safe_message);
+
+esp_err_t idf_lpa_run_profile_download(IdfModemId sim, const LpaActivationCode& activation_code,
+                                       const LpaDownloadObserver& observer,
+                                       LpaDownloadStats& stats,
+                                       std::string& safe_message);
+esp_err_t idf_lpa_run_authentication(IdfModemId sim, const LpaActivationCode& activation_code,
+                                     LpaAuthenticationResult& result,
+                                     std::string& safe_message);

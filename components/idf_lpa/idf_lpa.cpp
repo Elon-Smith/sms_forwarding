@@ -1,3 +1,4 @@
+#include "idf_network.h"
 #include "idf_lpa.h"
 
 #include <ctype.h>
@@ -479,6 +480,8 @@ static esp_err_t es9_post_json(const std::string& host,
                                std::string& message,
                                bool allow_empty_response = false)
 {
+    IdfNetworkGuard network;
+    if (!network.acquired()) return ESP_ERR_TIMEOUT;
     response_body.clear();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     if (now < kMinimumValidEpoch) {
@@ -939,7 +942,7 @@ static bool encode_imei_tbcd(const std::string& imei,
     return true;
 }
 
-static bool build_authenticate_server_request(const LpaActivationCode& activation_code,
+static bool build_authenticate_server_request(IdfModemId sim, const LpaActivationCode& activation_code,
                                               const std::vector<uint8_t>& transaction_id,
                                               const std::vector<uint8_t>& server_signed1,
                                               const std::vector<uint8_t>& server_signature1,
@@ -949,7 +952,7 @@ static bool build_authenticate_server_request(const LpaActivationCode& activatio
                                               std::string& message)
 {
     SensitiveText imei_text;
-    idf_modem_get_imei(imei_text.text);
+    idf_modem_get_imei(sim, imei_text.text);
     std::array<uint8_t, 8> imei = {};
     if (!encode_imei_tbcd(imei_text.text, imei, message)) return false;
 
@@ -1161,7 +1164,7 @@ std::string idf_lpa_mask_matching_id(const std::string& matching_id)
     return masked;
 }
 
-static esp_err_t run_authentication_session(const LpaActivationCode& activation_code,
+static esp_err_t run_authentication_session(IdfModemId sim, const LpaActivationCode& activation_code,
                                              bool allow_missing_protocol,
                                              LpaAuthenticationResult& result,
                                              LpaAuthSession& session,
@@ -1194,7 +1197,7 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
     SensitiveBytes response_transaction_id;
     std::array<uint8_t, 16> euicc_challenge = {};
 
-    esp_err_t err = idf_esim_lpa_get_auth_material(euicc_info1.value,
+    esp_err_t err = idf_esim_lpa_get_auth_material(sim, euicc_info1.value,
                                                    euicc_challenge,
                                                    safe_message);
     if (err != ESP_OK) return err;
@@ -1278,13 +1281,13 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (!build_authenticate_server_request(activation_code, transaction_id.value,
+    if (!build_authenticate_server_request(sim, activation_code, transaction_id.value,
                                            server_signed1.value, server_signature1.value,
                                            ci_key_id.value, server_certificate.value,
                                            authenticate_server_request.value, safe_message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    err = idf_esim_lpa_authenticate_server(authenticate_server_request.value,
+    err = idf_esim_lpa_authenticate_server(sim, authenticate_server_request.value,
                                             authenticate_server_response.value,
                                             safe_message);
     if (err != ESP_OK) return err;
@@ -1408,12 +1411,13 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
     return ESP_OK;
 }
 
-esp_err_t idf_lpa_run_authentication(const LpaActivationCode& activation_code,
+esp_err_t idf_lpa_run_authentication(IdfModemId sim, const LpaActivationCode& activation_code,
                                      LpaAuthenticationResult& result,
                                      std::string& safe_message)
 {
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
     LpaAuthSession session;
-    return run_authentication_session(activation_code, false, result, session, safe_message);
+    return run_authentication_session(sim, activation_code, false, result, session, safe_message);
 }
 
 namespace {
@@ -1440,6 +1444,7 @@ static void sample_largest_free_block(LpaDownloadStats& stats)
 
 class BppSegmentWriter {
 public:
+    explicit BppSegmentWriter(IdfModemId sim) : session_(sim) {}
     ~BppSegmentWriter() { close(); }
 
     esp_err_t begin(std::string& message)
@@ -1643,7 +1648,7 @@ private:
 
 class BppStreamParser {
 public:
-    BppStreamParser() = default;
+    explicit BppStreamParser(IdfModemId sim) : writer_(sim) {}
 
     esp_err_t feed(const uint8_t* data, size_t length, std::string& message);
     esp_err_t finish(std::string& message);
@@ -2467,6 +2472,8 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
                                    std::string& transaction_id,
                                    std::string& message)
 {
+    IdfNetworkGuard network;
+    if (!network.acquired()) return ESP_ERR_TIMEOUT;
     clear_string(transaction_id);
     message.clear();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
@@ -2979,7 +2986,7 @@ static bool parse_pending_notification(const std::vector<uint8_t>& response,
     return true;
 }
 
-static esp_err_t recover_pending_notifications(
+static esp_err_t recover_pending_notifications(IdfModemId sim,
     const std::string& current_host,
     bool allow_missing_protocol,
     const LpaDownloadObserver& observer,
@@ -2988,7 +2995,7 @@ static esp_err_t recover_pending_notifications(
     SensitiveBytes response;
     size_t list_offset = 0;
     size_t list_length = 0;
-    esp_err_t err = idf_esim_lpa_retrieve_notifications(
+    esp_err_t err = idf_esim_lpa_retrieve_notifications(sim,
         response.value, list_offset, list_length, message);
     if (err != ESP_OK || list_length == 0U) return err;
 
@@ -3067,7 +3074,7 @@ static esp_err_t recover_pending_notifications(
             clear_string(request.text);
             if (group_error != ESP_OK) break;
 
-            group_error = idf_esim_lpa_remove_notification(notification.sequenceNumber, message);
+            group_error = idf_esim_lpa_remove_notification(sim, notification.sequenceNumber, message);
             if (group_error != ESP_OK) break;
             ++sent_count;
         }
@@ -3118,11 +3125,12 @@ struct DownloadStatsGuard {
 
 }  // namespace
 
-esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
+esp_err_t idf_lpa_run_profile_download(IdfModemId sim, const LpaActivationCode& activation_code,
                                        const LpaDownloadObserver& observer,
                                        LpaDownloadStats& stats,
                                        std::string& safe_message)
 {
+    if (!idf_modem_id_valid(sim)) return ESP_ERR_INVALID_ARG;
     stats = LpaDownloadStats();
     safe_message.clear();
     DownloadStatsGuard stats_guard(stats);
@@ -3135,14 +3143,14 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         return failed(ESP_ERR_INVALID_ARG);
     }
     download_phase(observer, "recover_notifications", "正在检查待处理 eUICC 通知");
-    esp_err_t err = recover_pending_notifications(
+    esp_err_t err = recover_pending_notifications(sim,
         activation_code.smdpHost, observer.allow_missing_admin_protocol, observer, safe_message);
     if (err != ESP_OK) return failed(err);
 
     download_phase(observer, "authentication", "正在完成 SM-DP+ 认证");
     LpaAuthenticationResult auth_result;
     LpaAuthSession session;
-    err = run_authentication_session(activation_code,
+    err = run_authentication_session(sim, activation_code,
                                      observer.allow_missing_admin_protocol,
                                      auth_result, session, safe_message);
     sample_largest_free_block(stats);
@@ -3174,7 +3182,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         return failed(ESP_ERR_INVALID_ARG);
     }
     SensitiveBytes prepare_response;
-    err = idf_esim_lpa_prepare_download(prepare_request.value, prepare_response.value, safe_message);
+    err = idf_esim_lpa_prepare_download(sim, prepare_request.value, prepare_response.value, safe_message);
     clear_sensitive_bytes(prepare_request.value);
     if (err != ESP_OK) return failed(err);
     if (!parse_prepare_download_response(prepare_response.value, session.transactionId.value,
@@ -3200,7 +3208,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     clear_string(prepare_b64.text);
 
     download_phase(observer, "get_bpp", "正在获取并写入 Profile");
-    BppStreamParser bpp_parser;
+    BppStreamParser bpp_parser(sim);
     BppJsonStreamScanner bpp_json(bpp_parser, safe_message);
     SensitiveText response_transaction_id;
     err = es9_post_json_bpp(activation_code.smdpHost,
@@ -3261,9 +3269,17 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     if (err != ESP_OK) return failed(err);
 
     download_phase(observer, "remove_notification", "正在清理 eUICC 通知");
-    err = idf_esim_lpa_remove_notification(pir_info.sequenceNumber, safe_message);
+    err = idf_esim_lpa_remove_notification(sim, pir_info.sequenceNumber, safe_message);
     if (err != ESP_OK) return failed(err);
     download_phase(observer, "complete", "Profile 安装完成，未自动启用");
     safe_message = "Profile 安装完成，请按需显式启用";
     return ESP_OK;
 }
+
+esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
+                                       const LpaDownloadObserver& observer,
+                                       LpaDownloadStats& stats,
+                                       std::string& safe_message) { return idf_lpa_run_profile_download(IDF_SIM1, activation_code, observer, stats, safe_message); }
+esp_err_t idf_lpa_run_authentication(const LpaActivationCode& activation_code,
+                                     LpaAuthenticationResult& result,
+                                     std::string& safe_message) { return idf_lpa_run_authentication(IDF_SIM1, activation_code, result, safe_message); }

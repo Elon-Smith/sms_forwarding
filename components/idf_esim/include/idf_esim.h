@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <string>
 #include <vector>
@@ -34,3 +35,19 @@ esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& me
 std::string idf_esim_mask_profile_id(const std::string& identifier);
 // 判断一个 Profile 是否匹配用户输入的标识（ICCID/ISD-P AID/昵称/名称/运营商名，忽略大小写）
 bool idf_esim_profile_matches(const IdfEsimProfile& profile, const std::string& identifier);
+
+esp_err_t idf_esim_switch_profile(IdfModemId sim, const std::string& identifier, std::string& message);
+esp_err_t idf_esim_set_nickname(IdfModemId sim, const std::string& identifier,
+                                const std::string& nickname,
+                                std::string& message);
+esp_err_t idf_esim_delete_profile(IdfModemId sim, const std::string& identifier,
+                                  std::string& message);
+esp_err_t idf_esim_disable_profile(IdfModemId sim, const std::string& identifier, std::string& message);
+esp_err_t idf_esim_enable_profile(IdfModemId sim, const std::string& identifier, std::string& message);
+esp_err_t idf_esim_list_profiles(IdfModemId sim, std::vector<IdfEsimProfile>& profiles,
+                                 std::string& eid,
+                                 std::string& message);
+esp_err_t idf_esim_get_eid(IdfModemId sim, std::string& eid, std::string& message);
+
+// 0=待确认，1=已成功读取 EID，-1=明确不支持。超时不视为不支持。
+int idf_esim_capability(IdfModemId sim);

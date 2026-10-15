@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """编译真实配网保存与请求处理函数，检查 mDNS 持久化、旧请求兼容和错误边界。"""
 from pathlib import Path
+import shlex
 import os
 import re
 import subprocess
@@ -32,5 +33,5 @@ with tempfile.TemporaryDirectory(prefix="test-ap-provisioning-", dir=ROOT / "bui
     source = Path(temp) / "test.cpp"
     binary = Path(temp) / "test.exe"
     source.write_text(fixture, encoding="utf-8")
-    subprocess.run([os.environ.get("CXX", "g++"), "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
+    subprocess.run([*shlex.split(os.environ.get("CXX", "c++")), "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

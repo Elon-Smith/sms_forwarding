@@ -11,9 +11,10 @@ const document = {
   querySelectorAll: () => [], querySelector: () => null, addEventListener() {},
   createElement: () => element()
 };
-const context = {document, window: {addEventListener() {}}, location: {hash: ''},
+const context = {document, window: {addEventListener() {}}, URL, URLSearchParams, location: {hash: '',search:'?sim=2',href:'http://device/?sim=2'},
   localStorage: {getItem: () => null}, setTimeout: () => 0, clearTimeout() {},
   setInterval: () => 0, clearInterval() {}, confirm: () => true, console};
+context.window.fetch = (...args) => context.fetch(...args);
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../../code/web_src/app.js'), 'utf8'), context);
 for (let i = 0; i < 6; i++) {

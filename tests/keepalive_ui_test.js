@@ -16,7 +16,7 @@ function app(initialUrl, deferStatus = false) {
     appendChild: child => { elements[child.id] = child; }
   };
   const context = {
-    console, Date, Promise, URLSearchParams,
+    console, Date, Promise, URLSearchParams, URL, location: {search:'?sim=2', href:'http://device/?sim=2'},
     document: {
       getElementById: id => elements[id] || null, querySelectorAll: () => [],
       createElement: () => input(), addEventListener: (name, callback) => { listeners[name] = callback; }
@@ -32,7 +32,7 @@ function app(initialUrl, deferStatus = false) {
     addEventListener() {}, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, clearInterval() {},
     fetch: async (url, options) => {
       if (deferStatus && url.startsWith('/keepalive')) return new Promise(resolve => pending.push(data => resolve({ok: true, json: async () => data})));
-      if (url === '/save') {
+      if (url.startsWith('/save?')) {
         assert.equal(options.method, 'POST');
         const fields = new URLSearchParams(options.body.toString());
         assert.equal(fields.get('kaForm'), '1');

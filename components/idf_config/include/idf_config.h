@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <stdint.h>
 
@@ -9,7 +10,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.1.7";
+static constexpr const char* IDF_FW_VERSION = "1.1.7-dual.1";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "https://gg.incrafttime.top/api/payload?size=64342";
@@ -38,6 +39,7 @@ struct IdfWifiNetwork {
 
 // 进阶定时任务：可选定目标 eSIM Profile，每 N 天执行一个动作，完成后可切回原卡
 struct IdfSchedTask {
+    IdfModemId sim = IDF_SIM1;
     bool enabled = false;
     std::string name;        // 显示名
     std::string profile;     // 目标 eSIM Profile(ICCID/别名)；空 = 不切卡，用当前卡
@@ -65,7 +67,28 @@ struct IdfPushChannel {
     std::string customBody;
 };
 
-struct IdfConfig {
+struct IdfModemConfig {
+    bool kaEnabled = false;
+    int kaIntervalDays = 175;
+    uint8_t kaAction = 1;
+    std::string kaTarget;
+    std::string kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
+    std::string kaProfile;
+    uint32_t kaLastTime = 0;
+
+    bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
+    bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
+    bool dataEnabled = false;
+    bool roamingEnabled = true;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
+    std::string apn;
+    std::string operatorPlmn;
+    std::string phoneNumber;
+    IdfSimCredential simCredentials[IDF_MAX_SIM_CREDENTIALS];
+
+};
+
+struct IdfConfig : IdfModemConfig {
+    IdfModemConfig modem2;
     // 槽位 0 持久化在旧键 wifiSsid/wifiPass 上，其余在 wifiNSsid/wifiNPass，
     // OTA 回滚到旧固件仍能读到最近配网的网络
     IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
@@ -86,14 +109,6 @@ struct IdfConfig {
     std::string numberBlackList;
     std::string forwardRules;
 
-    bool kaEnabled = false;
-    int kaIntervalDays = 175;
-    uint8_t kaAction = 1;
-    std::string kaTarget;
-    std::string kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
-    std::string kaProfile;
-    uint32_t kaLastTime = 0;
-
     int tzOffsetMin = 480;
     std::string ntpServer = "ntp.aliyun.com";
     std::string mdnsHost = "sms";  // mDNS 主机名(<host>.local)，多设备部署可改名避免互相顶替
@@ -104,15 +119,6 @@ struct IdfConfig {
     bool smsHealthEnabled = false;
     int smsHealthHour = 10;
     bool smsHealthNotify = true;
-
-    bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
-    bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
-    bool dataEnabled = false;
-    bool roamingEnabled = true;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
-    std::string apn;
-    std::string operatorPlmn;
-    std::string phoneNumber;
-    IdfSimCredential simCredentials[IDF_MAX_SIM_CREDENTIALS];
 
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
     IdfSchedTask schedTasks[IDF_MAX_SCHED_TASKS];
@@ -351,3 +357,30 @@ void idf_config_copy_mdns_host(char* out, size_t cap);
 // (esp_timer 任务)判断是否需要扫描选网，锁内只数个数
 std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void);
 int idf_config_wifi_network_count(void);
+
+inline IdfModemConfig& idf_config_modem(IdfConfig& c, IdfModemId sim) { return sim == 2 ? c.modem2 : static_cast<IdfModemConfig&>(c); }
+inline const IdfModemConfig& idf_config_modem(const IdfConfig& c, IdfModemId sim) { return sim == 2 ? c.modem2 : static_cast<const IdfModemConfig&>(c); }
+
+esp_err_t idf_config_save_keepalive(IdfModemId sim, bool enabled, int interval_days, uint8_t action,
+                                    const std::string& target, const std::string& url,
+                                    const std::string& profile);
+esp_err_t idf_config_save_sim(IdfModemId sim, bool data_enabled, bool roaming_enabled, const std::string& apn,
+                              const std::string& operator_plmn, const std::string& phone_number,
+                              const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS]);
+esp_err_t idf_config_set_keepalive_last(IdfModemId sim, uint32_t epoch);
+esp_err_t idf_config_record_sim_unlock_result(IdfModemId sim, const std::string& iccid, bool puk, bool success);
+esp_err_t idf_config_set_net_led_enabled(IdfModemId sim, bool enabled);
+esp_err_t idf_config_set_call_notify_enabled(IdfModemId sim, bool enabled);
+IdfKeepaliveRunView idf_config_get_keepalive_run_view(IdfModemId sim);
+IdfSimSettingsView idf_config_get_sim_settings_view(IdfModemId sim);
+IdfSimUnlockView idf_config_get_sim_unlock_view(IdfModemId sim, const std::string& iccid);
+bool idf_config_net_led_enabled(IdfModemId sim);
+bool idf_config_call_notify_enabled(IdfModemId sim);
+IdfConfigWebView idf_config_get_web_view(IdfModemId sim);
+IdfConfigStatusView idf_config_get_status_view(IdfModemId sim);
+
+IdfSchedulerView idf_config_get_scheduler_view(IdfModemId sim);
+IdfSchedRunView idf_config_get_sched_run_view(IdfModemId sim, int index);
+
+bool idf_config_same_sched_task(const IdfSchedTask& a, const IdfSchedTask& b);
+esp_err_t idf_config_set_sched_last_if(int index, uint32_t epoch, const IdfSchedTask& expected);

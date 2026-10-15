@@ -493,3 +493,7 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
     }
+
+.sim-picker{padding:12px;display:grid;gap:6px;font-size:13px}.sim-picker select{padding:8px;border:1px solid #ccc;border-radius:6px;max-width:100%}.sim-picker small{font-size:11px;color:#555}.dual-status{white-space:pre-line;line-height:1.8;padding:16px;background:#eef5ff;border-radius:10px;margin-bottom:16px;font-size:13px}@media(max-width:768px){.sim-picker{padding:6px;font-size:11px}.sim-picker small{display:none}}
+
+@media(max-width:768px){.sim-picker{position:fixed;top:8px;right:12px;z-index:80;padding:5px 8px;border-radius:8px;background:var(--card-bg,#fff);box-shadow:0 1px 8px #0002}.sim-picker label{display:none}.sim-picker select{padding:5px;font-size:12px}.main{padding-top:56px}}

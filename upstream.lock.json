@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/MineSunshineone/sms_forwarding",
+  "commit": "d4271d46f40bca215d2fba966b83051a1a4460be",
+  "upstream_version": "1.1.7",
+  "esp_idf": "v6.0.2",
+  "firmware_version": "1.1.7-dual.1",
+  "project_name": "sms_forwarding_dual",
+  "hardware_status": "PENDING",
+  "automatic_upstream_updates": false
+}

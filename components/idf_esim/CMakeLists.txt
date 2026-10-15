@@ -4,6 +4,7 @@ idf_component_register(
     "idf_esim_codec.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    idf_board
     idf_logbuf
     idf_modem
 )

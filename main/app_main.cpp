@@ -7,6 +7,7 @@
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
+#include "idf_network.h"
 #include "idf_push.h"
 #include "idf_sms.h"
 #include "idf_web.h"
@@ -70,10 +71,13 @@ extern "C" void app_main(void)
              static_cast<unsigned>(WEB_INDEX.length),
              static_cast<unsigned>(WEB_APP_CSS.length),
              static_cast<unsigned>(WEB_APP_JS.length));
+    ESP_ERROR_CHECK(idf_network_init());
     idf_esim_init();  // 注册 SIM 热插拔钩子，换卡后 EID 缓存随之失效
     log_start_result("WiFi", idf_wifi_start(idf_config_get()));
     log_start_result("推送后台 worker", idf_push_start());
     log_start_result("HTTP 服务器", idf_web_start());
-    log_start_result("模组", idf_modem_start(idf_config_get()));
-    log_start_result("短信接收", idf_sms_start());
+    for (IdfModemId sim = 1; sim <= IDF_MODEM_COUNT; ++sim) {
+        log_start_result(sim == 1 ? "模组1" : "模组2", idf_modem_start(sim, idf_config_get()));
+        log_start_result(sim == 1 ? "短信1" : "短信2", idf_sms_start(sim));
+    }
 }

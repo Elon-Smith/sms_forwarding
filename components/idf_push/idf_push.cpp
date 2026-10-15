@@ -1,3 +1,4 @@
+#include "idf_network.h"
 #include "idf_push.h"
 
 #include <errno.h>
@@ -83,6 +84,8 @@ enum : uint8_t {
 };
 
 struct PushJob {
+    std::string receiver;
+    IdfModemId sim = IDF_SIM1;
     bool used = false;
     uint8_t channel = 0;
     uint8_t attempts = 0;
@@ -96,6 +99,8 @@ struct PushJob {
 };
 
 struct ForwardJob {
+    std::string receiver;
+    IdfModemId sim = IDF_SIM1;
     bool used = false;
     bool pushQueued = false;
     uint8_t attempts = 0;
@@ -282,11 +287,11 @@ static std::string utf8_truncate(const std::string& value, size_t max_bytes)
     return value.substr(0, end) + "...";
 }
 
-static std::string local_phone_number()
+static std::string local_phone_number(IdfModemId sim)
 {
-    IdfModemStatus modem = idf_modem_get_status();
+    IdfModemStatus modem = idf_modem_get_status(sim);
     if (!modem.phone.empty()) return modem.phone;
-    return idf_config_get_status_view().phoneNumber;
+    return idf_config_get_status_view(sim).phoneNumber;
 }
 
 static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
@@ -599,7 +604,7 @@ static bool regex_search_case_insensitive(const std::string& pattern, const std:
     return hit;
 }
 
-IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,
+IdfForwardRuleDecision idf_push_eval_forward_rules(IdfModemId sim, const std::string& rules,
                                                    const std::string& sender,
                                                    const std::string& body)
 {
@@ -613,10 +618,15 @@ IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,
         pos = end + (end < rules.size() ? 1 : 0);
         if (line.empty()) continue;
 
+        ++rule_index;
+        if (line.compare(0, 5, "SIM1:") == 0 || line.compare(0, 5, "SIM2:") == 0) {
+            IdfModemId target = static_cast<IdfModemId>(line[3] - '0');
+            line.erase(0, 5);
+            if (target != sim) continue;
+        }
         size_t t1 = line.find('\t');
         size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
         if (t1 == std::string::npos || t2 == std::string::npos) continue;
-        ++rule_index;
         size_t t3 = line.find('\t', t2 + 1);
         std::string type = line.substr(0, t1);
         std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
@@ -660,24 +670,26 @@ static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
     return step + (jitter ? (seed % (jitter + 1)) : 0);
 }
 
-static bool http_transport_available()
+static bool http_transport_available(IdfModemId card = IDF_SIM1)
 {
     if (idf_wifi_get_status().staConnected) return true;
-    const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
-    return sim.dataEnabled && idf_modem_get_status().modemReady;
+    const IdfSimSettingsView sim = idf_config_get_sim_settings_view(card);
+    return sim.dataEnabled && idf_modem_get_status(card).modemReady;
 }
 
-static esp_err_t http_request(const std::string& url, const char* method,
+static esp_err_t http_request(IdfModemId card, const std::string& url, const char* method,
                               const char* content_type, const std::string& body,
                               int& status_code)
 {
+    IdfNetworkGuard network;
+    if (!network.acquired()) return ESP_ERR_TIMEOUT;
     if (!idf_wifi_get_status().staConnected) {
-        const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+        const IdfSimSettingsView sim = idf_config_get_sim_settings_view(card);
         IdfCellularHttpConfig cfg;
         cfg.dataEnabled = sim.dataEnabled;
         cfg.apn = sim.apn;
         IdfCellularHttpResult result;
-        esp_err_t err = idf_modem_cellular_http_request(url, method, content_type, body, cfg, result);
+        esp_err_t err = idf_modem_cellular_http_request(card, url, method, content_type, body, cfg, result);
         status_code = result.httpStatus;
         return err;
     }
@@ -1123,6 +1135,8 @@ static std::string base64_wrap76(const std::string& data)
 
 static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& subject, const std::string& body)
 {
+    IdfNetworkGuard network;
+    if (!network.acquired()) return false;
     if (!cfg.emailConfigured) {
         idf_log_line("邮件配置不完整，跳过发送");
         return false;
@@ -1207,16 +1221,15 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     return ok;
 }
 
-static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
+static bool send_to_channel(IdfModemId sim, const IdfPushChannel& channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
-                            bool notify = false)
+                            bool notify = false, const std::string& receiver = {})
 {
     if (!channel_valid(channel)) return false;
 
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
     std::string timestamp = timestamp_raw ? timestamp_raw : "";
-    std::string receiver = notify ? std::string() : local_phone_number();
     std::string sender_json = json_escape(sender);
     std::string text_json = json_escape(text);
     std::string ts_json = json_escape(timestamp);
@@ -1359,7 +1372,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
 
     std::string name = channel.name.empty() ? ("通道" + std::to_string(channel.type)) : channel.name;
     int code = 0;
-    esp_err_t err = http_request(url, method, content_type, body, code);
+    esp_err_t err = http_request(sim, url, method, content_type, body, code);
     bool ok = (err == ESP_OK && code >= 200 && code < 300);
     // 发送中+响应码两行合并为一行结果，降噪同时保留通道名与成败
     if (err == ESP_OK) idf_logf("%s 推送%s (HTTP %d)", name.c_str(), ok ? "成功" : "失败", code);
@@ -1370,7 +1383,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
 static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const std::string& text,
                                     const std::string& timestamp, uint8_t attempts, uint32_t delay_sec,
                                     bool notify = false, uint32_t inbox_id = 0,
-                                    uint32_t completion_id = 0)
+                                    uint32_t completion_id = 0, IdfModemId sim = IDF_SIM1, const std::string& receiver = {})
 {
     int slot = -1;
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
@@ -1386,6 +1399,8 @@ static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const
     PushJob& job = s_push_jobs[slot];
     job.used = true;
     job.channel = ch;
+    job.sim = sim;
+    job.receiver = receiver;
     job.attempts = attempts;
     job.notify = notify;
     job.nextUs = esp_timer_get_time() + static_cast<int64_t>(delay_sec) * 1000000LL;
@@ -1457,9 +1472,11 @@ static bool enqueue_forward_job_locked(const ForwardJob& src, uint32_t delay_sec
     return false;
 }
 
-static bool enqueue_forward_locked(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+static bool enqueue_forward_locked(IdfModemId sim, const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
 {
     ForwardJob job;
+    job.sim = sim;
+    job.receiver = local_phone_number(sim);
     job.sender = sender ? sender : "";
     job.text = text ? text : "";
     job.timestamp = timestamp ? timestamp : "";
@@ -1528,7 +1545,7 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    IdfForwardRuleDecision fd = idf_push_eval_forward_rules(cfg.forwardRules, job.sender, job.text);
+    IdfForwardRuleDecision fd = idf_push_eval_forward_rules(job.sim, cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则 %d 命中：丢弃短信 id=%u", fd.ruleIndex,
                  static_cast<unsigned>(job.inboxId));
@@ -1537,12 +1554,13 @@ static bool process_forward_one()
         return true;
     }
 
+    const std::string tagged = "[SIM" + std::to_string(job.sim) + "] " + job.text;
     uint32_t mask = fd.matched ? fd.chMask : 0xFFFFFFFFu;
     bool email_selected = fd.matched ? fd.email : true;
     if (!cfg.pushEnabled) mask = 0;
     // 本机号码只用于邮件正文；不走邮件时省掉一次模组状态查询(含互斥锁)
     const std::string receiver = (email_selected && cfg.emailEnabled && cfg.emailConfigured)
-                                     ? local_phone_number() : std::string();
+                                     ? job.receiver : std::string();
     int dispatched = 0;
     bool email_queued = false;
     bool enqueue_failed = false;
@@ -1577,8 +1595,8 @@ static bool process_forward_one()
             for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS && !enqueue_failed; ++i) {
                 if (!(mask & (1u << i))) continue;
                 if (!channel_valid(cfg.pushChannels[i])) continue;
-                if (enqueue_push_job_locked(i, job.sender, job.text, job.timestamp, 0, 0, false,
-                                            job.inboxId, completion_id)) {
+                if (enqueue_push_job_locked(i, job.sender, tagged, job.timestamp, 0, 0, false,
+                                            job.inboxId, completion_id, job.sim, job.receiver)) {
                     ++dispatched;
                     had_queued_target = true;
                     if (!targets.empty()) targets += "、";
@@ -1596,7 +1614,7 @@ static bool process_forward_one()
             std::string subject = "短信";
             subject += job.sender;
             subject += ",";
-            subject += utf8_truncate(job.text, 48);
+            subject += utf8_truncate(tagged, 48);
             std::string body = "来自：";
             body += job.sender;
             if (!receiver.empty()) {
@@ -1608,7 +1626,7 @@ static bool process_forward_one()
                 body += job.timestamp;
             }
             body += "，内容：";
-            body += job.text;
+            body += tagged;
             email_queued = enqueue_email_job_locked(subject, body, 0, 0, job.inboxId, completion_id);
             if (email_queued) had_queued_target = true;
             else {
@@ -1664,7 +1682,7 @@ static bool low_heap_defer()
 
 static bool process_push_one()
 {
-    if (!http_transport_available()) return false;
+    if (!http_transport_available(1) && !http_transport_available(2)) return false;
     if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     PushJob job;
@@ -1678,6 +1696,7 @@ static bool process_push_one()
     }
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
         if (!s_push_jobs[i].used || s_push_jobs[i].nextUs > now) continue;
+        if (!http_transport_available(s_push_jobs[i].sim)) continue;
         if (channel_cooling(s_push_jobs[i].channel, now)) continue;  // 连续失败的通道冷却期内跳过
         picked = static_cast<int>(i);
         job = s_push_jobs[i];
@@ -1697,8 +1716,8 @@ static bool process_push_one()
         return true;
     }
 
-    bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
-                              job.timestamp.c_str(), job.notify);
+    bool ok = send_to_channel(job.sim, channel, job.sender.c_str(), job.text.c_str(),
+                              job.timestamp.c_str(), job.notify, job.receiver);
     note_channel_result(job.channel, ok);
     if (ok) {
         note_forward_target_success(job.completionId);
@@ -1719,7 +1738,7 @@ static bool process_push_one()
     bool requeued = false;
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         requeued = enqueue_push_job_locked(job.channel, job.sender, job.text, job.timestamp,
-                                           job.attempts, delay, job.notify, job.inboxId, job.completionId);
+                                           job.attempts, delay, job.notify, job.inboxId, job.completionId, job.sim, job.receiver);
         xSemaphoreGive(s_mutex);
     }
     if (!requeued) {
@@ -1838,7 +1857,7 @@ static bool process_test_one()
     } else {
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
-        ok = send_to_channel(channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
+        ok = send_to_channel(IDF_SIM1, channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
                              ts.empty() ? "时间未同步" : ts.c_str());
         s_busy.store(false, std::memory_order_relaxed);
         result = ok ? "测试推送已发送" : "测试推送失败，请查看日志";
@@ -1890,12 +1909,13 @@ esp_err_t idf_push_start(void)
     return ESP_OK;
 }
 
-bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+bool idf_push_enqueue_forward(IdfModemId sim, const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
 {
+    if (!idf_modem_id_valid(sim)) return false;
     if (!ensure_init()) return false;
     // 临界区都很短(纯内存操作)，无限等锁保证收到的短信绝不因锁竞争被丢
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
-    bool ok = enqueue_forward_locked(sender, text, timestamp, inbox_id);
+    bool ok = enqueue_forward_locked(sim, sender, text, timestamp, inbox_id);
     xSemaphoreGive(s_mutex);
     if (ok) wake_worker();
     else idf_log_line("转发队列已满，短信暂未转发");
@@ -2042,3 +2062,6 @@ std::string idf_push_test_status_json(uint8_t channel)
     out += "}";
     return out;
 }
+
+bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id) { return idf_push_enqueue_forward(1, sender, text, timestamp, inbox_id); }
+IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body) { return idf_push_eval_forward_rules(1, rules, sender, body); }

@@ -16,3 +16,7 @@ preview/index.html
 
 __pycache__/
 *.py[cod]
+
+/dist/
+/hardware-tests/
+!/dependencies.lock

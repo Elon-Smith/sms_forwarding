@@ -1,4 +1,5 @@
 #pragma once
+#include "idf_board.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -6,6 +7,8 @@
 #include <string>
 
 struct IdfInboxEntry {
+    IdfModemId sim = 0;
+    std::string iccid;
     uint32_t id = 0;
     uint32_t recvEpoch = 0;
     std::string sender;
@@ -15,6 +18,7 @@ struct IdfInboxEntry {
 };
 
 struct IdfSentEntry {
+    IdfModemId sim = 0;
     uint32_t id = 0;
     uint32_t sentEpoch = 0;
     std::string target;
@@ -34,3 +38,7 @@ bool idf_inbox_delete(uint32_t id);
 void idf_sent_add(const char* target, const char* text, bool ok);
 
 std::string idf_inbox_json(bool sent_box, int limit);
+
+uint32_t idf_inbox_add(IdfModemId sim, const std::string& iccid, const char* sender, const char* text, const char* ts);
+void idf_sent_add(IdfModemId sim, const char* target, const char* text, bool ok);
+std::string idf_inbox_json(bool sent_box, int limit, IdfModemId sim);

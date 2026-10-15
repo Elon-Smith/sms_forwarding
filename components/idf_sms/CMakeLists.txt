@@ -2,6 +2,7 @@ idf_component_register(
   SRCS "idf_sms.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    idf_board
     esp_timer
     idf_config
     idf_inbox

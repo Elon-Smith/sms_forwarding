@@ -28,7 +28,7 @@ static constexpr size_t BODY_MAX = 320;
 static constexpr const char* SMS_NVS_PART = "smsdata";
 static constexpr const char* NS_INBOX = "inbox";
 static constexpr const char* NS_SENT = "sent";
-static constexpr uint8_t BLOB_VERSION = 1;
+static constexpr uint8_t BLOB_VERSION = 2;
 
 struct InboxSlot : IdfInboxEntry {
     bool deleted = false;
@@ -94,6 +94,8 @@ static void persist_inbox_entry(const InboxSlot& e)
     blob_put_str(blob, e.sender, false);
     blob_put_str(blob, e.ts, false);
     blob_put_str(blob, e.text, true);
+    blob_put_u8(blob, e.sim);
+    blob_put_str(blob, e.iccid, false);
     char key[16];
     inbox_key(key, sizeof(key), e.id);
     if (nvs_set_blob(s_inbox_nvs, key, blob.data(), blob.size()) == ESP_OK) {
@@ -120,6 +122,7 @@ static void persist_sent_entry(const IdfSentEntry& e)
     blob_put_u32(blob, e.sentEpoch);
     blob_put_str(blob, e.target, false);
     blob_put_str(blob, e.text, true);
+    blob_put_u8(blob, e.sim);
     char key[16];
     sent_key(key, sizeof(key), e.id);
     if (nvs_set_blob(s_sent_nvs, key, blob.data(), blob.size()) == ESP_OK) {
@@ -178,8 +181,9 @@ static void load_inbox_from_flash()
         e.sender = r.str(false);
         e.ts = r.str(false);
         e.text = r.str(true);
+        if (ver >= 2) { e.sim = r.u8(); e.iccid = r.str(false); }
         e.forwarded = forwarded;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        if ((ver != 1 && ver != BLOB_VERSION) || !r.ok || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -212,8 +216,9 @@ static void load_sent_from_flash()
         e.sentEpoch = r.u32();
         e.target = r.str(false);
         e.text = r.str(true);
+        if (ver >= 2) e.sim = r.u8();
         e.ok = ok;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        if ((ver != 1 && ver != BLOB_VERSION) || !r.ok || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -244,10 +249,7 @@ static void load_from_flash()
 static void init_persistence()
 {
     esp_err_t err = nvs_flash_init_partition(SMS_NVS_PART);
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase_partition(SMS_NVS_PART);
-        err = nvs_flash_init_partition(SMS_NVS_PART);
-    }
+    // smsdata 同时保存双卡配置，初始化失败只降级，不自动擦除用户数据。
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "smsdata 分区初始化失败(%s)，短信留存降级为纯内存", esp_err_to_name(err));
         return;
@@ -303,7 +305,7 @@ void idf_inbox_init(void)
     }
 }
 
-uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
+uint32_t idf_inbox_add(IdfModemId sim, const std::string& iccid, const char* sender, const char* text, const char* ts)
 {
     ensure_init();
     // 收到短信后入库不能因为网页正在读/flash 正在提交而放弃；SMS 任务本来就是串行处理。
@@ -313,6 +315,7 @@ uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
     // 环满时该物理槽即将覆盖最旧短信：先把它的 flash key 擦掉，保持 NVS 只存活动条目
     uint32_t evict_id = (s_inbox_filled == INBOX_MAX && !e.deleted) ? e.id : 0;
     e.id = ++s_inbox_seq;
+    e.sim = sim; e.iccid = iccid;
     e.recvEpoch = static_cast<uint32_t>(time(nullptr));
     e.sender = sender ? sender : "";
     e.ts = ts ? ts : "";
@@ -373,6 +376,7 @@ bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out)
     bool ok = false;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
+            out.sim = s_inbox[i].sim; out.iccid = s_inbox[i].iccid;
             out.id = s_inbox[i].id;
             out.recvEpoch = s_inbox[i].recvEpoch;
             out.sender = s_inbox[i].sender;
@@ -408,7 +412,7 @@ bool idf_inbox_delete(uint32_t id)
     return ok;
 }
 
-void idf_sent_add(const char* target, const char* text, bool ok)
+void idf_sent_add(IdfModemId sim, const char* target, const char* text, bool ok)
 {
     ensure_init();
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
@@ -416,6 +420,7 @@ void idf_sent_add(const char* target, const char* text, bool ok)
     IdfSentEntry& e = s_sent[s_sent_head];
     uint32_t evict_id = (s_sent_filled == SENT_MAX && e.id != 0) ? e.id : 0;
     e.id = ++s_sent_seq;
+    e.sim = sim;
     e.sentEpoch = static_cast<uint32_t>(time(nullptr));
     e.target = target ? target : "";
     e.text = truncate_body(text);
@@ -428,7 +433,7 @@ void idf_sent_add(const char* target, const char* text, bool ok)
     xSemaphoreGive(s_mutex);
 }
 
-std::string idf_inbox_json(bool sent_box, int limit)
+std::string idf_inbox_json(bool sent_box, int limit, IdfModemId sim)
 {
     // 单次持锁直接遍历环形缓冲：避免"取数量、再逐条取"期间新短信入库导致的
     // 条目错位/重复，也把 51 次锁往返 + O(n²) 扫描降为一次 O(n)
@@ -450,10 +455,12 @@ std::string idf_inbox_json(bool sent_box, int limit)
             if (limit > 0 && emitted >= static_cast<size_t>(limit)) break;
             size_t idx = (s_sent_head + SENT_MAX - 1 - k) % SENT_MAX;
             const IdfSentEntry& e = s_sent[idx];
+            if (sim && e.sim != sim) continue;
             if (emitted) out += ",";
             snprintf(buf, sizeof(buf), "{\"id\":%u,\"sent\":%u,",
                      static_cast<unsigned>(e.id), static_cast<unsigned>(e.sentEpoch));
             out += buf;
+            out += "\"sim\":" + std::to_string(e.sim) + ",";
             json_prop(out, "target", e.target); out += ",";
             json_prop(out, "text", e.text); out += ",";
             out += "\"ok\":";
@@ -467,11 +474,13 @@ std::string idf_inbox_json(bool sent_box, int limit)
             if (limit > 0 && emitted >= static_cast<size_t>(limit)) break;
             size_t idx = (s_inbox_head + INBOX_MAX - 1 - k) % INBOX_MAX;
             const InboxSlot& e = s_inbox[idx];
+            if (sim && e.sim != sim) continue;
             if (e.deleted) continue;
             if (emitted) out += ",";
             snprintf(buf, sizeof(buf), "{\"id\":%u,\"recv\":%u,",
                      static_cast<unsigned>(e.id), static_cast<unsigned>(e.recvEpoch));
             out += buf;
+            out += "\"sim\":" + std::to_string(e.sim) + ",";
             json_prop(out, "sender", e.sender); out += ",";
             json_prop(out, "ts", e.ts); out += ",";
             json_prop(out, "text", e.text); out += ",";
@@ -485,3 +494,7 @@ std::string idf_inbox_json(bool sent_box, int limit)
     out += "]";
     return out;
 }
+
+uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts) { return idf_inbox_add(1, "", sender, text, ts); }
+void idf_sent_add(const char* target, const char* text, bool ok) { idf_sent_add(1, target, text, ok); }
+std::string idf_inbox_json(bool sent_box, int limit) { return idf_inbox_json(sent_box, limit, 0); }

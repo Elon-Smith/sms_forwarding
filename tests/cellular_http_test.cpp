@@ -37,6 +37,9 @@ int uart_read_bytes(int, uint8_t* buf, size_t size, unsigned delay) {
     size_t n=std::min(size, uart_data.size());
     memcpy(buf,uart_data.data(),n); uart_data.erase(0,n); return static_cast<int>(n);
 }
+uint32_t s_uart_generation = 0;
+struct UrcIdentity { uint32_t generation = 1; } urc_identity;
+UrcIdentity idf_modem_get_status() { return urc_identity; }
 std::string s_uart_line_carry;
 int64_t s_uart_line_started_us=0, s_uart_wait_cmt_until_us=0;
 bool s_uart_wait_cmt_pdu=false;

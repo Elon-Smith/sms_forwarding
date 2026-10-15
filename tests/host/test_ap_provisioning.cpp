@@ -19,33 +19,17 @@ struct Config {
     bool wifiFromFallback = false;
 };
 static Config s_config, persisted;
-static std::array<IdfWifiNetwork, IDF_MAX_WIFI_NETWORKS> pending_networks;
-static std::string pending_mdns;
-static bool mdns_written = false, fail_mdns_write = false, fail_commit = false;
-static int s_config_mutex = 1, s_persist_mutex = 2, commit_count = 0;
+static bool fail_mdns_write = false, fail_commit = false;
+static int s_config_mutex = 1, commit_count = 0;
 static void xSemaphoreTake(int, int) {}
 static void xSemaphoreGive(int) {}
-static esp_err_t begin_field_save(nvs_handle_t* nvs) { *nvs = 1; mdns_written = false; return ESP_OK; }
-static esp_err_t write_wifi_networks(nvs_handle_t, const IdfWifiNetwork* networks)
-{
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) pending_networks[i] = networks[i];
-    return ESP_OK;
-}
-static esp_err_t write_str(nvs_handle_t, const char* key, const std::string& value)
-{
-    assert(std::string(key) == "mdnsHost");
-    if (fail_mdns_write) return ESP_FAIL;
-    pending_mdns = value; mdns_written = true;
-    return ESP_OK;
-}
-static esp_err_t commit_field_save(nvs_handle_t, esp_err_t err, const char*)
-{
-    if (err != ESP_OK || fail_commit) return ESP_FAIL;
-    ++commit_count;
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) persisted.wifiNetworks[i] = pending_networks[i];
-    if (mdns_written) persisted.mdnsHost = pending_mdns;
-    return ESP_OK;
-}
+class ConfigTransaction {
+    Config desired=s_config;
+public:
+    int error() const {return ESP_OK;}
+    Config& next(){return desired;}
+    int commit(){if(fail_mdns_write || fail_commit)return ESP_FAIL; s_config=desired; persisted=desired; ++commit_count; return ESP_OK;}
+};
 esp_err_t idf_config_save_wifi(const std::string&, const std::string&, const std::string* = nullptr);
 static void idf_config_copy_mdns_host(char* out, size_t size) { std::snprintf(out, size, "%s", s_config.mdnsHost.c_str()); }
 

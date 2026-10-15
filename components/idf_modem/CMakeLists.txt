@@ -2,6 +2,7 @@ idf_component_register(
   SRCS "idf_modem.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    idf_board
     esp_driver_gpio
     esp_driver_uart
     esp_timer
