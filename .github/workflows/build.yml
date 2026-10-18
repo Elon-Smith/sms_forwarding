@@ -1,39 +1,72 @@
-name: Dual C3 candidate (hardware acceptance pending)
+name: ESP-IDF 5.5.5 candidate checks
 on:
-  push:
-    branches: [codex/upstream-dual-modem]
-  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact approved source commit
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact saved source commit (empty uses this workflow revision)
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
   host-regressions:
+    if: github.event_name != 'workflow_dispatch' || github.actor == 'Elon-Smith'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - run: python tools/test_all.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: host-regressions
+          name: host-regressions-${{ inputs.ref || github.sha }}
           path: build/regression/
+          retention-days: 30
   build:
     needs: host-regressions
     runs-on: ubuntu-latest
     container: espressif/idf:v5.5.5
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Build fixed SDK and upstream patches
         shell: bash
         run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           . "$IDF_PATH/export.sh"
           python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
           python -m unittest discover -s tools/tests -v
           idf.py --no-ccache -B build/idf5.5.5 -D SDKCONFIG=build/sdkconfig.idf5.5.5 build
           python tools/verify_build.py --idf-path "$IDF_PATH"
           python tools/package_candidate.py
+      - name: Identify artifact
+        id: identity
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob,json,os
+          files=glob.glob('dist/*/manifest.json')
+          assert len(files)==1
+          m=json.load(open(files[0]))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('name=dual-c3-idf555-up'+m['upstream_commit'][:12]+'-src'+m['git_head'][:12]+'-candidate\n')
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: dual-c3-candidate-not-hardware-accepted
+          name: ${{ steps.identity.outputs.name }}
           path: dist/
-          retention-days: 14
+          retention-days: 30
+          if-no-files-found: error

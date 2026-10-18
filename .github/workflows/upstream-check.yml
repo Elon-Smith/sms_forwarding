@@ -1,0 +1,25 @@
+name: 检查上游更新
+on:
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+jobs:
+  detect:
+    if: github.repository == 'Elon-Smith/sms_forwarding' && github.ref == 'refs/heads/codex/upstream-dual-modem'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 仅检查并通知
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/upstream_sync.py detect

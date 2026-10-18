@@ -1,0 +1,71 @@
+name: 批准同步并构建
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 更新提醒 Issue 编号
+        required: true
+        type: string
+      upstream_sha:
+        description: 提醒中的完整上游 SHA（40 位）
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'Elon-Smith/sms_forwarding' && github.ref == 'refs/heads/codex/upstream-dual-modem' && github.actor == 'Elon-Smith' && github.triggering_actor == 'Elon-Smith'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      prepared: ${{ steps.prepare.outputs.prepared }}
+      head: ${{ steps.prepare.outputs.head }}
+      pr: ${{ steps.prepare.outputs.pr }}
+      issue: ${{ steps.prepare.outputs.issue }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 校验批准并准备草稿 PR（不执行候选代码）
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_ISSUE: ${{ inputs.issue_number }}
+          APPROVED_SHA: ${{ inputs.upstream_sha }}
+        run: python tools/upstream_sync.py prepare --issue "$APPROVED_ISSUE" --sha "$APPROVED_SHA"
+  candidate:
+    needs: prepare
+    if: needs.prepare.outputs.prepared == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.head }}
+  report:
+    needs: [prepare, candidate]
+    if: always() && needs.prepare.outputs.prepared == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: 写回构建结果（不执行候选代码）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_ISSUE: ${{ needs.prepare.outputs.issue }}
+          SYNC_PR: ${{ needs.prepare.outputs.pr }}
+          SYNC_HEAD: ${{ needs.prepare.outputs.head }}
+          BUILD_RESULT: ${{ needs.candidate.result }}
+        run: python tools/upstream_sync.py finalize --issue "$SYNC_ISSUE" --pr "$SYNC_PR" --head "$SYNC_HEAD" --result "$BUILD_RESULT"

@@ -1,6 +1,6 @@
 # 当前双模组开发约定
 
-本分支仅基于上游 d4271d46f40bca215d2fba966b83051a1a4460be / ESP-IDF 5.5.5。不得迁入旧本地工程源码或配置。保留上游组件位置，双卡接口显式携带 IdfModemId (1/2)，禁止全局当前卡。引脚集中在 idf_board。旧工程必须在实机验收通过后才能清理；设备计费短信由用户手动执行。下方上游说明与双卡实现冲突时以上述约定和 dev_doc/upstream_dual_modem.md 为准。
+本分支上游来源记录在 upstream.lock.json，初始基线 d4271d46f40bca215d2fba966b83051a1a4460be；ESP-IDF 始终固定 5.5.5。上游更新必须通过 dev_doc/upstream_sync.md 的提醒及人工批准流程，不自动合并、升级 SDK 或烧录。不得迁入旧本地工程源码或配置。保留上游组件位置，双卡接口显式携带 IdfModemId (1/2)，禁止全局当前卡。引脚集中在 idf_board。旧工程必须在实机验收通过后才能清理；设备计费短信需另行明确授权。下方上游说明与双卡实现冲突时以上述约定和 dev_doc/upstream_dual_modem.md 为准。
 
 # AGENTS.md
 

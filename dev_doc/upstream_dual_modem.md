@@ -4,7 +4,7 @@
 
 ## 基线和目录
 
-- 上游：<https://github.com/MineSunshineone/sms_forwarding/tree/d4271d46f40bca215d2fba966b83051a1a4460be>，1.1.7，提交固定为 `d4271d46f40bca215d2fba966b83051a1a4460be`。
+- 初始上游：<https://github.com/MineSunshineone/sms_forwarding/tree/d4271d46f40bca215d2fba966b83051a1a4460be>，1.1.7。当前已合入提交以 `upstream.lock.json` 为准；后续更新遵循 [批准后同步流程](upstream_sync.md)，不自动升级 SDK。
 - SDK：ESP-IDF **5.5.5**，使用适配后的 `tools/apply_idf_patches.py` 与 `patches/idf5.5.5/`；不自动升级。SDK 改动按 2026-10-15 最新指令覆盖原 6.0.2 计划。应用版本 `1.1.7-dual.2-idf555`，项目标识 `sms_forwarding_dual`。
 - 开发分支 `codex/upstream-dual-modem`。开发目录为原工程的同级目录 `SMS-Forwarder-C3-upstream-dual`；这是交付前的独立工作副本。
 - 保留 `main/`、`components/`、`code/web_src/`、上游 PDU/TLS/LPA 实现。没有迁入本地旧 Arduino/IDF 源码、凭据、适配层或配置。新增的 `idf_board` 集中板级约束，`idf_network` 串行化 TLS 资源。
@@ -66,7 +66,7 @@ python -X utf8 tools/package_candidate.py
 
 若 Windows 主机编译器为 Zig，可设置 `$env:CXX = '<zig.exe 的路径> c++ -Dtimegm=_mkgmtime -Wno-nullability-completeness'`。C 测试同时设置 `$env:CC = '<zig.exe 的路径> cc'`。含空格的编译器路径用引号包住。Linux 使用 `CXX=c++`，导出 IDF 环境后运行上游补丁脚本，再 `idf.py --no-ccache -B build/idf5.5.5 -D SDKCONFIG=build/sdkconfig.idf5.5.5 build`。网页只编辑 `code/web_src/`，执行 `python tools/build_web_assets.py` 更新资源；CI 检查生成文件一致性。
 
-CI 固定 `espressif/idf:v5.5.5`，先主机回归再编译并上传候选 artifact。当前取消自动发布稳定 Release。构建日志、回归原始输出位于忽略跟踪的 `build/`；本次结果见 `dev_doc/idf555_rebuild_report.md`；旧 6.0.2 记录保留于 `dev_doc/upstream_dual_test_report.md`，不代表本次构建。
+CI 固定 `espressif/idf:v5.5.5`，仅在人工批准同步或手动运行构建时先主机回归、再编译并上传候选 artifact。取消自动发布稳定 Release。新包目录名包含上游及源码提交标识，保留 30 天。构建日志、回归原始输出位于忽略跟踪的 `build/`；首次构建结果见 `dev_doc/idf555_rebuild_report.md`；旧 6.0.2 记录保留于 `dev_doc/upstream_dual_test_report.md`，不代表本次构建。
 
 构建目录固定为 `build/idf5.5.5`，配置为 `build/sdkconfig.idf5.5.5`。不复用 `build/idf6` 或机器级 ccache。构建后自动核查 SDK 提交、全部子模块及活动补丁、GCC 14.2.0、IDF 5.5 Python、组件/编译路径；打包再次核查，并验证应用和 bootloader 的 ESP 校验和与附加 SHA-256、应用/ELF 对应关系。详情保存在 `environment-audit.json`。
 

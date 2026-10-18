@@ -4,6 +4,7 @@ on:
 
 jobs:
   auto_close_issues:
+    if: github.repository != 'Elon-Smith/sms_forwarding'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
