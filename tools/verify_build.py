@@ -130,6 +130,10 @@ def verify(build, sdk):
     app = (build / description['app_bin']).read_bytes()
     identity = image_identity(app)
     require(identity['version'] == description['project_version'], 'Stale application image')
+    config_header = (ROOT / 'components/idf_config/include/idf_config.h').read_text('utf-8')
+    web_version = re.search(r'IDF_FW_VERSION\s*=\s*"([^"]+)"', config_header)
+    require(web_version is not None and web_version.group(1) == identity['version'],
+            'Web/status version differs from the application descriptor')
     files = [description['app_bin'], description['app_elf'], 'bootloader/bootloader.bin',
              'partition_table/partition-table.bin', 'compile_commands.json', 'bootloader/compile_commands.json']
     report = {'status': 'PASS', 'sdk': '5.5.5', 'sdk_commit': SDK_COMMIT, 'sdk_path': str(sdk),

@@ -9,7 +9,7 @@
 - 上游固定提交：`d4271d46f40bca215d2fba966b83051a1a4460be`，版本 1.1.7。
 - 独立基线检出：`D:\dev\sms-upstream-baseline-d4271d4`，跟踪源码无修改；同一独立 IDF 6.0.2 和上游补丁流程编译成功。基线应用大小 `0x148b80`，OTA 槽 `0x1a0000`。原始记录 `baseline-build.log`。
 - 新工程：`D:\Workspace\SMS-Forwarder-C3-upstream-dual`，分支 `codex/upstream-dual-modem`。未迁入旧源码、私有 Wi-Fi 或通知配置。
-- 旧工程外部归档：`C:\Users\44681\.codex\backups\SMS-Forwarder-C3\20261015-upstream-dual`。包含工作树、`.git`、未跟踪及忽略文件、私有资料、构建和回退产物。41,427 个文件、1,994,058,173 字节，逐文件大小/SHA-256 已比对；Git refs/status/fsck 已保存。清单 `MANIFEST.json`，恢复副本在 `workspace/`。该归档含私有资料，不纳入新工程 Git。
+- 旧工程外部归档：`<用户目录>\.codex\backups\SMS-Forwarder-C3\20261015-upstream-dual`。包含工作树、`.git`、未跟踪及忽略文件、私有资料、构建和回退产物。41,427 个文件、1,994,058,173 字节，逐文件大小/SHA-256 已比对；Git refs/status/fsck 已保存。清单 `MANIFEST.json`，恢复副本在 `workspace/`。该归档含私有资料，不纳入新工程 Git。
 - 原 `D:\Workspace\SMS-Forwarder-C3` 保持原状，未替换、未清空。
 
 ## 软件检查

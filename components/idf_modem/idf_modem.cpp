@@ -2270,10 +2270,20 @@ void modem_power_cycle(void)
 bool wait_at_ready(void)
 {
     TickDeadline deadline(MODEM_POWERUP_MAX_MS);
+    size_t received = 0;
+    esp_err_t last_error = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
-        if (send_ok("AT", 700)) return true;
+        std::string response;
+        last_error = idf_modem_send_at("AT", 700, response);
+        received += response.size();
+        if (last_error == ESP_OK) return true;
         vTaskDelay(pdMS_TO_TICKS(250));
     }
+    // 仅记录握手响应长度，不将模组原始内容或卡身份写入诊断日志。
+    idf_logf("AT握手诊断 UART%d TX=%d RX=%d EN=%d baud=%d 响应字节=%u 最后错误=%s",
+             static_cast<int>(MODEM_UART), static_cast<int>(MODEM_TXD),
+             static_cast<int>(MODEM_RXD), static_cast<int>(MODEM_EN), MODEM_BAUD,
+             static_cast<unsigned>(received), esp_err_to_name(last_error));
     return false;
 }
 
