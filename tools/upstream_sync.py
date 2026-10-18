@@ -46,6 +46,16 @@ def guard_paths(paths):
     return sorted(p for p in paths if any(p.startswith(x) if x.endswith('/') else p == x for x in PROTECTED))
 
 
+def mirror_needs_update(root, mirror, target):
+    if mirror == target:
+        return False
+    if ancestor(root, mirror, target):
+        return True
+    if ancestor(root, target, mirror):
+        return False
+    raise ValueError('Upstream mirror has diverged; refusing to overwrite')
+
+
 def parse_request(issue):
     if issue.get('user', {}).get('login') != 'github-actions[bot]' or issue.get('pull_request'):
         raise ValueError('Only workflow-created notification issues are accepted')
@@ -253,7 +263,10 @@ def prepare(root, gh, number, target):
                 head = saved_head
             else:
                 git(temp, 'push', remote, head + ':refs/heads/' + branch, env=env)
-            gh.api('PATCH', f'/repos/{FORK}/git/refs/heads/master', {'sha':target,'force':False})
+            mirror = gh.ref(FORK, BRANCH)
+            git(temp, 'fetch', '--no-tags', remote, BRANCH)
+            if mirror_needs_update(temp, mirror, target):
+                gh.api('PATCH', f'/repos/{FORK}/git/refs/heads/master', {'sha':target,'force':False})
         pr = gh.api('POST', f'/repos/{FORK}/pulls', {'title':'同步上游 ' + target[:12] + '（ESP-IDF 5.5.5）',
             'head':branch,'base':BASE,'draft':True,'body':f'经 @{OWNER} 手动批准，合并上游 `{target}`，双模组基线 `{current}`。\n\n关联提醒 #{number}。SDK 保持 5.5.5；构建结果随后附上。候选未经硬件验收，不自动合并或烧录。'})
         gh.comment(number, '已创建草稿 PR，正在执行主机测试和 5.5.5 构建：' + pr['html_url'], 'prepared')

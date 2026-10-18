@@ -1,6 +1,4 @@
-import contextlib
 import copy
-import io
 import json
 import os
 from pathlib import Path
@@ -126,6 +124,12 @@ class MergeTests(unittest.TestCase):
         sync.git(self.root,'checkout','--orphan','rewritten');sync.git(self.root,'rm','-rf','.')
         self.write('fresh','new root');target=self.commit('unrelated')
         with self.assertRaisesRegex(ValueError,'history changed'):sync.merge_candidate(self.root,self.base,target,self.previous)
+    def test_mirror_never_rewinds_an_earlier_approved_commit(self):
+        self.write('new','update');target=self.commit('new upstream')
+        self.assertTrue(sync.mirror_needs_update(self.root,self.previous,target))
+        self.assertFalse(sync.mirror_needs_update(self.root,target,target))
+        self.assertFalse(sync.mirror_needs_update(self.root,target,self.previous))
+        with self.assertRaisesRegex(ValueError,'diverged'):sync.mirror_needs_update(self.root,self.base,target)
     def test_invalid_sdk_lock_and_nonancestor_rejected(self):
         sync.git(self.root,'checkout','--detach',self.base)
         lock=read_lock(self.root);lock['sdk_version']='6.0.2';self.write('upstream.lock.json',json.dumps(lock))

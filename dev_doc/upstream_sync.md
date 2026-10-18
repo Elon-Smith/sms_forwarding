@@ -2,6 +2,8 @@
 
 Fork：<https://github.com/Elon-Smith/sms_forwarding>。默认分支 `codex/upstream-dual-modem` 保存双模组工程；`master` 是批准过的上游源码对照。`origin` 为本 Fork，`upstream` 为 `MineSunshineone/sms_forwarding`。固定 SDK 5.5.5，不自动合并 PR、发布稳定版或访问设备。
 
+初次配置验证见 [2026-10-18 验证记录](upstream_sync_validation_20261018.md)。
+
 ## 当前版本与回退
 
 同步配置前已保存当前修正，回退标签为 `codex/dual-idf555-before-sync-20261018`，提交 `30af225867f643b1bc832e3b1be9a1c741850610`。硬件验收仍未完成。工作区外保留经验证的 Git bundle、当时固件和 SHA-256 清单；原始日志、号码、凭据、Flash 备份不上传。
